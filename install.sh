@@ -83,13 +83,73 @@ ln -sfn "$dest" "$INSTALL_DIR/current"
 
 echo "Installed to $dest"
 echo "Linked     $BIN_DIR/codegraph"
+
+# 5. 自动将 BIN_DIR 添加到 PATH（写入 shell 配置文件）
+# 这样 codegraph 命令可以在终端、VS Code、Cursor、Claude Code 等环境中被找到
 case ":$PATH:" in
-  *":$BIN_DIR:"*) ;;
+  *":$BIN_DIR:"*)
+    echo "$BIN_DIR 已在 PATH 中"
+    ;;
   *)
     echo ""
-    echo "$BIN_DIR is not on your PATH. Add it:"
-    echo "  export PATH=\"$BIN_DIR:\$PATH\""
+    echo "$BIN_DIR 不在 PATH 中，正在自动添加..."
+    
+    # 检测当前使用的 shell 并写入对应的配置文件
+    current_shell="$(basename "${SHELL:-/bin/sh}")"
+    added=false
+    
+    # 函数：检查并添加 PATH 到配置文件
+    add_path_to_file() {
+      local file="$1"
+      local export_line="export PATH=\"$BIN_DIR:\$PATH\""
+      
+      if [ -f "$file" ]; then
+        # 检查是否已经存在
+        if grep -qF "$BIN_DIR" "$file" 2>/dev/null; then
+          echo "  已在 $file 中配置"
+          return 0
+        fi
+        # 添加 PATH
+        echo "" >> "$file"
+        echo "# CodeGraph - added by install.sh on $(date '+%Y-%m-%d %H:%M:%S')" >> "$file"
+        echo "$export_line" >> "$file"
+        echo "  已添加到 $file"
+        return 0
+      fi
+      return 1
+    }
+    
+    # 根据 shell 类型写入配置文件
+    case "$current_shell" in
+      zsh)
+        add_path_to_file "$HOME/.zshrc" && added=true
+        add_path_to_file "$HOME/.zprofile" && added=true
+        ;;
+      bash)
+        add_path_to_file "$HOME/.bashrc" && added=true
+        add_path_to_file "$HOME/.bash_profile" && added=true
+        add_path_to_file "$HOME/.profile" && added=true
+        ;;
+      *)
+        # 通用配置
+        add_path_to_file "$HOME/.profile" && added=true
+        add_path_to_file "$HOME/.bashrc" && added=true
+        ;;
+    esac
+    
+    if [ "$added" = true ]; then
+      echo ""
+      echo "✓ PATH 已自动配置。请执行以下操作之一使配置生效："
+      echo "  - 重新打开终端"
+      echo "  - 或运行: source ~/.bashrc (或 ~/.zshrc)"
+      echo "  - 或重启 VS Code / Cursor / Claude Code"
+    else
+      echo ""
+      echo "⚠ 无法自动配置 PATH，请手动添加："
+      echo "  export PATH=\"$BIN_DIR:\$PATH\""
+    fi
     ;;
 esac
+
 echo ""
 echo "Done. Run: codegraph --help"

@@ -102,11 +102,15 @@ export class McpClient {
    * @param command - Absolute path to the codegraph executable
    * @param args - CLI arguments (e.g., ['serve', '--mcp'])
    * @param cwd - Working directory for the child process (project root)
+   * @param env - 子进程的环境变量（可选）。如果提供，将用于 spawn 子进程。
+   *              这确保了 PATH 包含 ~/.local/bin 等常见安装目录，
+   *              避免 "Executable not found in $PATH" 错误。
    */
   constructor(
     private command: string,
     private args: string[] = [],
-    private cwd?: string
+    private cwd?: string,
+    private env?: NodeJS.ProcessEnv
   ) {}
 
   /**
@@ -152,9 +156,11 @@ export class McpClient {
   private async _doStart(): Promise<void> {
     return new Promise((resolve, reject) => {
       // Spawn with stdio pipes so we can read/write JSON-RPC messages
+      // 使用传入的 env（如果提供），确保 PATH 包含 ~/.local/bin 等目录
       this.process = spawn(this.command, this.args, {
         cwd: this.cwd,
         stdio: ['pipe', 'pipe', 'pipe'],
+        env: this.env,
       });
 
       if (!this.process.stdout || !this.process.stdin) {

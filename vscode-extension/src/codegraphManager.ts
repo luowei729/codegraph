@@ -498,10 +498,13 @@ export class CodeGraphManager implements vscode.Disposable {
     // Stop any previous client before starting a new one
     this.client?.stop();
 
+    // 使用 buildSpawnEnv() 确保子进程的 PATH 包含 ~/.local/bin 等常见安装目录，
+    // 避免 "Executable not found in $PATH" 错误
     this.client = new McpClient(
       codegraphPath,
       ['serve', '--mcp'],
-      this.projectPath
+      this.projectPath,
+      this.buildSpawnEnv()
     );
 
     // Bug #4 fix: Register crash callback so we transition to 'error' state
@@ -567,6 +570,57 @@ export class CodeGraphManager implements vscode.Disposable {
   }
 
   /**
+   * 构建 spawn 子进程时使用的环境变量。
+   * 
+   * 为什么需要这个？因为 VS Code 扩展宿主进程继承的 PATH 可能不包含
+   * ~/.local/bin（codegraph 独立安装器的默认安装位置）。
+   * 如果 PATH 中缺少该目录，spawn('codegraph', ...) 会报
+   * "Executable not found in $PATH" 错误。
+   * 
+   * 解决方案：在 spawn 前主动将 ~/.local/bin 加入 PATH 环境变量，
+   * 确保 codegraph 命令及其依赖（如 node）都能被正确找到。
+   * 这不会影响系统全局 PATH，只影响当前子进程。
+   */
+  private buildSpawnEnv(): NodeJS.ProcessEnv {
+    const env = { ...process.env };
+    const homeDir = process.env.HOME || process.env.USERPROFILE || '';
+    
+    // 需要确保在 PATH 中的目录列表
+    const dirsToAdd: string[] = [];
+    
+    if (process.platform !== 'win32') {
+      // macOS/Linux: 添加 ~/.local/bin 和 ~/.codegraph/bin
+      if (homeDir) {
+        dirsToAdd.push(path.join(homeDir, '.local', 'bin'));
+        dirsToAdd.push(path.join(homeDir, '.codegraph', 'bin'));
+      }
+      dirsToAdd.push('/usr/local/bin');
+    } else {
+      // Windows: 添加常见安装位置
+      if (homeDir) {
+        dirsToAdd.push(path.join(homeDir, '.codegraph', 'bin'));
+        dirsToAdd.push(path.join(homeDir, 'AppData', 'Local', 'codegraph'));
+      }
+    }
+    
+    // 检查 PATH 中是否已包含这些目录，如果没有则添加
+    const currentPath = env.PATH || env.Path || '';
+    const pathSeparator = process.platform === 'win32' ? ';' : ':';
+    const pathDirs = currentPath.split(pathSeparator);
+    
+    const missingDirs = dirsToAdd.filter(dir => 
+      dir && !pathDirs.includes(dir) && fs.existsSync(dir)
+    );
+    
+    if (missingDirs.length > 0) {
+      env.PATH = [...missingDirs, ...pathDirs].join(pathSeparator);
+      console.log(`[CodeGraph] 已将以下目录加入子进程 PATH: ${missingDirs.join(', ')}`);
+    }
+    
+    return env;
+  }
+
+  /**
    * Find the codegraph executable using a tiered search strategy:
    *
    * Tier 1: Local node_modules/.bin/codegraph (project-local install)
@@ -587,12 +641,14 @@ export class CodeGraphManager implements vscode.Disposable {
       }
     }
 
-    // Tier 2: Global PATH
+    // Tier 2: Global PATH — 使用 buildSpawnEnv 确保 PATH 包含常见安装目录
     try {
       const whichCmd = process.platform === 'win32' ? 'where' : 'which';
+      const spawnEnv = this.buildSpawnEnv();
       const globalBin = execSync(`${whichCmd} codegraph`, {
         encoding: 'utf8',
         timeout: 3000,
+        env: spawnEnv,
       }).trim();
       if (globalBin && fs.existsSync(globalBin)) {
         return globalBin;
@@ -657,6 +713,9 @@ export class CodeGraphManager implements vscode.Disposable {
    * After "Developer: Reload Window", .codegraph/ already existed (from the
    * init that did run to completion before the pipe filled), so activate() took
    * the isInit=true path and started the MCP server directly, bypassing init.
+   * 
+   * 另外，使用 buildSpawnEnv() 确保子进程的 PATH 包含 ~/.local/bin 等常见安装目录，
+   * 避免 "Executable not found in $PATH" 错误。
    */
   private async runCliCommand(subcommand: string, args: string[] = []): Promise<void> {
     const codegraphPath = this.findCodeGraphCommand();
@@ -667,6 +726,7 @@ export class CodeGraphManager implements vscode.Disposable {
     return new Promise((resolve, reject) => {
       const child = spawn(codegraphPath, [subcommand, ...args], {
         cwd: this.projectPath,
+        env: this.buildSpawnEnv(),
       });
 
       let stdout = '';
