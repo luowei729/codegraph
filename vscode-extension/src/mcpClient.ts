@@ -78,6 +78,13 @@ export class McpClient {
   private killTimeout: ReturnType<typeof setTimeout> | null = null;
 
   /**
+   * Flag indicating that stop() was called intentionally (e.g., deleteIndex,
+   * extension deactivation). When true, the close event handler skips the
+   * onCrash callback to avoid showing a spurious "process crashed" error.
+   */
+  private intentionalStop = false;
+
+  /**
    * Bug E fix: Guard against concurrent start() calls.
    * If start() is already in progress, subsequent calls return the same promise
    * instead of spawning a duplicate process.
@@ -179,6 +186,16 @@ export class McpClient {
         const wasReady = this.ready;
         this.ready = false;
 
+        // If stop() was called intentionally (e.g., deleteIndex, deactivation),
+        // skip the onCrash callback to avoid showing a spurious error message.
+        // This fixes the bug where "Delete Index" showed "CodeGraph 服务进程意外退出"
+        // because stop() sends SIGTERM, and the close handler treated it as a crash.
+        if (this.intentionalStop) {
+          this.intentionalStop = false; // reset for next start
+          this.rejectPending(new Error('Client stopped intentionally'));
+          return;
+        }
+
         if (code !== 0 && code !== null) {
           // Non-zero exit code — abnormal termination
           this.rejectPending(new Error(`CodeGraph process exited with code ${code}`));
@@ -264,6 +281,11 @@ export class McpClient {
    * this.process, so the SIGKILL timeout callback can still reference it.
    */
   stop(): void {
+    // Mark this as an intentional stop so the close event handler
+    // doesn't trigger the onCrash callback (which would show a
+    // spurious "process crashed" error message to the user)
+    this.intentionalStop = true;
+
     this.rejectPending(new Error('Client stopped'));
     // Cancel any pending force-kill timeout
     if (this.killTimeout) {

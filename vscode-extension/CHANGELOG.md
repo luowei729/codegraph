@@ -5,6 +5,69 @@
 
 ---
 
+### 2026-06-08 07:52
+
+**改动内容：** 修复删除索引时弹窗报错"服务进程意外退出"
+
+**Bug 描述：**
+- 建立索引后 → 点击「删除索引」→ 弹窗报错："CodeGraph 服务进程意外退出（代码 null）"
+
+**根本原因：**
+`deleteIndex()` 调用 `this.client?.stop()` 时，`stop()` 向子进程发送 `SIGTERM` 信号。
+子进程收到信号后退出，触发 `close` 事件（`signal='SIGTERM'`, `code=null`）。
+`close` 事件处理器将信号终止视为异常崩溃，调用 `onCrash` 回调 →
+Manager 显示错误弹窗："服务进程意外退出"。
+
+但这是**有意终止**，不是异常崩溃。`close` 事件处理器无法区分两者。
+
+**修复方案：**
+- 在 `McpClient` 中新增 `intentionalStop` 标志
+- `stop()` 调用时设置 `intentionalStop = true`
+- `close` 事件处理器检查此标志：如果为 true，跳过 `onCrash` 回调，不显示错误弹窗
+- 处理完成后重置标志，不影响下次启动
+
+**变更文件：**
+- `vscode-extension/src/mcpClient.ts` — 新增 `intentionalStop` 标志；`stop()` 中设置标志；`close` 事件处理器中检查标志
+- `vscode-extension/package.json` — version 改为 `0.9.16`
+
+**验证：**
+- TypeScript 编译通过，0 错误 0 警告
+- 打包成功: `codegraph-vscode-plugin-0.9.16.vsix` (84 KB)
+
+---
+
+### 2026-06-08 07:43
+
+**改动内容：** 修复新项目建立索引卡住的问题
+
+**Bug 描述：**
+- 新项目打开 → 弹窗提示「建立索引」→ 点击后卡住
+- Developer: Reload Window 后索引才能建立成功
+
+**根本原因：**
+`runCliCommand()` 使用 `spawn()` 运行 `codegraph init -i` 时，只监听了 `stderr`，没有消费 `stdout`。
+CodeGraph 的 `init` 命令使用 clack（交互式终端 UI）输出进度条到 stdout，
+当 OS 管道缓冲区（Linux 默认 64KB）被 stdout 数据填满后，
+子进程的 `write()` 调用被阻塞，进程挂起 → `close` 事件永远不触发 →
+`runCliCommand()` 的 Promise 永远不 resolve → `initialize()` 卡住。
+
+Reload Window 后成功是因为：`.codegraph/` 已由第一次 init 创建（在管道填满前已完成），
+所以 `activate()` 走 `isInit=true` 路径直接启动 MCP 服务器，跳过了 init 命令。
+
+**修复方案：**
+- 在 `runCliCommand()` 中添加 `child.stdout.on('data', ...)` 消费 stdout 数据
+- 同时将进度输出记录到控制台（截断防刷屏），方便调试
+
+**变更文件：**
+- `vscode-extension/src/codegraphManager.ts` — `runCliCommand()` 新增 stdout 消费
+- `vscode-extension/package.json` — version 改为 `0.9.15`
+
+**验证：**
+- TypeScript 编译通过，0 错误 0 警告
+- 打包成功: `codegraph-vscode-plugin-0.9.15.vsix` (83 KB)
+
+---
+
 ### 2026-06-08 07:03
 
 **改动内容：** 完全隔离扩展代码 — 还原上游文件 + 迁移开发日志

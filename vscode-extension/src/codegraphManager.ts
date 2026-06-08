@@ -643,6 +643,20 @@ export class CodeGraphManager implements vscode.Disposable {
    *
    * Captures stdout/stderr and resolves/rejects based on exit code.
    * Used for init, sync, index, etc. (synchronous operations, not MCP server).
+   *
+   * Critical fix: We MUST consume stdout data to prevent pipe buffer saturation.
+   * CodeGraph's CLI commands (especially `init`) use clack (interactive terminal UI)
+   * which writes shimmer progress bars and log messages to stdout. If stdout is not
+   * consumed, the OS pipe buffer (typically 64KB on Linux) fills up, causing the
+   * child process to block on write() and hang indefinitely. The `close` event
+   * never fires, so the Promise never resolves, and the extension appears stuck.
+   *
+   * This is why "建立索引" (Build Index) appeared to hang on new projects —
+   * `codegraph init -i` wrote progress output to stdout, which wasn't drained,
+   * the pipe filled, the process blocked, and initialize() never completed.
+   * After "Developer: Reload Window", .codegraph/ already existed (from the
+   * init that did run to completion before the pipe filled), so activate() took
+   * the isInit=true path and started the MCP server directly, bypassing init.
    */
   private async runCliCommand(subcommand: string, args: string[] = []): Promise<void> {
     const codegraphPath = this.findCodeGraphCommand();
@@ -655,7 +669,20 @@ export class CodeGraphManager implements vscode.Disposable {
         cwd: this.projectPath,
       });
 
+      let stdout = '';
       let stderr = '';
+
+      // CRITICAL: Drain stdout to prevent pipe buffer saturation.
+      // Without this, the child process blocks when the OS pipe buffer fills
+      // (clack progress output can exceed the 64KB pipe buffer limit).
+      child.stdout?.on('data', (data: Buffer) => {
+        stdout += data.toString();
+        // Log progress output for debugging (truncated to avoid flooding)
+        const lines = data.toString().split('\n').filter(l => l.trim());
+        for (const line of lines.slice(0, 3)) {
+          console.log(`[CodeGraph ${subcommand}] ${line.trim()}`);
+        }
+      });
 
       child.stderr?.on('data', (data: Buffer) => {
         stderr += data.toString();
