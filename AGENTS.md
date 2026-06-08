@@ -29,6 +29,23 @@
     3. 重新编译 `vscode-extension/out/` 确保代码最新
   - 验证: MCP 服务可通过绝对路径正常启动并返回 initialize 响应
 
+  ## 修改记录
+
+### 2026-06-08 17:05 修复 VS Code 插件 MCP 报错 `Executable not found in $PATH: "codegraph"`
+
+**问题根因**: 
+- VS Code 扩展宿主进程继承的 PATH 可能不包含 `~/.local/bin`（codegraph 独立安装器的默认安装位置）
+- `install.sh` 只打印提示但不自动配置 PATH，导致 `codegraph` 命令在 IDE 环境中不可见
+
+**修复内容**:
+1. **`install.sh`**: 自动将 `~/.local/bin` 写入 shell 配置文件（`.bashrc`/`.zshrc`/`.profile` 等）
+2. **VS Code 扩展 v0.9.17**:
+   - 新增 `buildSpawnEnv()` 方法，在 spawn 子进程前主动将常见安装目录加入 PATH
+   - `McpClient` 支持传入自定义环境变量
+   - `findCodeGraphCommand()` 和 `runCliCommand()` 均使用增强后的 PATH
+
+**验证**: 重新打包 `codegraph-vscode-plugin-0.9.17.vsix`，安装后 MCP 服务可正常启动
+
 ### 0.9.11
 - Initial release
 - Semantic code intelligence via CodeGraph CLI
