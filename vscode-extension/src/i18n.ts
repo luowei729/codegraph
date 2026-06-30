@@ -439,6 +439,32 @@ const messages = {
     en: 'CodeGraph extension deactivating...',
     zh: 'CodeGraph 扩展正在停用...',
   },
+
+  // ---- Agent 自动配置 ----
+  'agentConfig.alreadyConfigured': {
+    en: 'CodeGraph is already configured in all detected AI agents.',
+    zh: 'CodeGraph 已配置到所有检测到的 AI 代理中。',
+  },
+  'agentConfig.configuring': {
+    en: 'Configuring CodeGraph for AI agents (Claude Code, Cursor, Codex, etc.)...',
+    zh: '正在为 AI 代理配置 CodeGraph（Claude Code、Cursor、Codex 等）...',
+  },
+  'agentConfig.success': {
+    en: 'CodeGraph configured for all detected AI agents. Restart your agents to apply.',
+    zh: 'CodeGraph 已配置到所有检测到的 AI 代理。请重启代理以生效。',
+  },
+  'agentConfig.partial': {
+    en: 'CodeGraph configured for some AI agents. See Output panel for details.',
+    zh: 'CodeGraph 已配置到部分 AI 代理。详情请查看输出面板。',
+  },
+  'agentConfig.failed': {
+    en: 'Failed to configure CodeGraph for AI agents: {0}',
+    zh: '为 AI 代理配置 CodeGraph 失败: {0}',
+  },
+  'agentConfig.configureAgents': {
+    en: 'Configure CodeGraph for AI Agents',
+    zh: '为 AI 代理配置 CodeGraph',
+  },
 } as const;
 
 // =============================================================================

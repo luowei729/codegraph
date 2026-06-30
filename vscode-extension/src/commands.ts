@@ -404,6 +404,14 @@ export function registerCommands(
       // This command is registered so the view title button can trigger it.
       vscode.commands.executeCommand('codegraph.refreshTree');
     }),
+
+    // -------------------------------------------------------------------------
+    // Agent configuration (为 AI 代理配置 CodeGraph)
+    // -------------------------------------------------------------------------
+
+    vscode.commands.registerCommand('codegraph.configureAgents', async () => {
+      await manager.configureAgentsManual();
+    }),
   ];
 
   context.subscriptions.push(...commands);

@@ -5,6 +5,20 @@
 
 ---
 
+### 0.9.20 (2026-06-30)
+- **新增功能**: 支持 Qoder AI 代理的 MCP 自动配置
+  - **配置路径**: `~/.config/QoderCN/SharedClientCache/mcp.json`
+  - **实现**: 新增 `src/installer/targets/qoder.ts` 模块
+  - **功能**: 
+    - 自动检测 Qoder 是否已安装
+    - 自动写入 CodeGraph MCP 服务器配置
+    - 支持幂等安装（重复运行不会产生重复配置）
+    - 支持卸载（移除 CodeGraph 配置）
+  - **变更文件**:
+    - `src/installer/targets/qoder.ts` — 新增 Qoder target 实现
+    - `src/installer/targets/registry.ts` — 注册 qoderTarget
+    - `src/installer/targets/types.ts` — 添加 'qoder' 到 TargetId 联合类型
+    - `package.json` — 版本升级到 0.9.20
 
 ---
 

@@ -7,5 +7,6 @@
   "codegraph.showCallees.title": "Show Callees",
   "codegraph.showImpact.title": "Show Impact",
   "codegraph.reindex.title": "Re-index",
-  "codegraph.refresh.title": "Refresh"
+  "codegraph.refresh.title": "Refresh",
+  "codegraph.configureAgents.title": "Configure for AI Agents"
 }

@@ -32,6 +32,7 @@ import * as path from 'path';
 import * as fs from 'fs';
 import { spawn, execSync } from 'child_process';
 import { McpClient } from './mcpClient';
+import { configureAgents } from './agentConfig';
 import { t } from './i18n';
 
 /** Possible states of the CodeGraph extension */
@@ -138,6 +139,14 @@ export class CodeGraphManager implements vscode.Disposable {
         return;
       }
     }
+
+    // Auto-configure CodeGraph into all detected AI agents (Claude Code,
+    // Cursor, Codex, opencode, Gemini, Kiro, etc.) on every activation.
+    // This is idempotent — skips agents that are already configured.
+    // Runs in the background so it doesn't delay the MCP server startup.
+    this.ensureAgentConfig().catch((err) => {
+      console.warn('[CodeGraph] background agent config failed:', err);
+    });
 
     const isInit = this.isCodeGraphInitialized(this.projectPath);
 
@@ -312,6 +321,24 @@ export class CodeGraphManager implements vscode.Disposable {
     return this.projectPath;
   }
 
+  /**
+   * Manually trigger agent configuration from the Command Palette.
+   * Shows feedback to the user unlike the automatic background version.
+   */
+  async configureAgentsManual(): Promise<void> {
+    const codegraphPath = this.findCodeGraphCommand();
+    if (!codegraphPath) {
+      vscode.window.showErrorMessage(t('error.commandNotFound'));
+      return;
+    }
+
+    const result = await configureAgents(codegraphPath, this.buildSpawnEnv(), false);
+    if (result.alreadyConfigured) {
+      vscode.window.showInformationMessage(result.message);
+    }
+    // configureAgents already shows success/warning messages
+  }
+
   /** Dispose all resources (called on extension deactivation) */
   dispose(): void {
     this.client?.stop();
@@ -322,6 +349,23 @@ export class CodeGraphManager implements vscode.Disposable {
   // ---------------------------------------------------------------------------
   // Private helpers
   // ---------------------------------------------------------------------------
+
+  /**
+   * Ensure CodeGraph is configured in all detected AI agents.
+   *
+   * Called on every extension activation as a background task.
+   * Idempotent — if all agents are already configured, returns immediately.
+   * If some agents need configuration, runs `codegraph install --yes`
+   * non-interactively.
+   *
+   * This does NOT block the MCP server startup — it runs in parallel.
+   */
+  private async ensureAgentConfig(): Promise<void> {
+    const codegraphPath = this.findCodeGraphCommand();
+    if (!codegraphPath) return; // no CLI available, skip silently
+
+    await configureAgents(codegraphPath, this.buildSpawnEnv(), true);
+  }
 
   /**
    * Auto-install CodeGraph when it's not found on the system.
