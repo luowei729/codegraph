@@ -465,6 +465,10 @@ const messages = {
     en: 'Configure CodeGraph for AI Agents',
     zh: '为 AI 代理配置 CodeGraph',
   },
+  'agentConfig.noAgents': {
+    en: 'No AI agents detected. Install Claude Code, Cursor, Codex, or Qoder to auto-configure.',
+    zh: '未检测到 AI 代理。安装 Claude Code、Cursor、Codex 或 Qoder 后将自动配置。',
+  },
 } as const;
 
 // =============================================================================

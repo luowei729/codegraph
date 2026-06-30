@@ -5,20 +5,48 @@
 
 ---
 
+### 0.9.22 (2026-06-30)
+- 正式支持 Kilo Code MCP 自动配置
+  - 配置路径: `~/.config/kilo/kilo.jsonc` (全局)
+  - 项目级: `kilo.jsonc` 或 `.kilo/kilo.jsonc`
+  - 使用 `mcp` 键（不是 `mcpServers`），command 为数组格式
+
+---
+
+### 0.9.21 (2026-06-30)
+- 新增 Kilo Code 支持
+  - 配置路径: `~/.config/kilo/kilo.jsonc` (全局)
+  - 项目级: `kilo.jsonc` 或 `.kilo/kilo.jsonc`
+  - 使用 `mcp` 键（不是 `mcpServers`）
+  - command 为数组格式
+- **支持的代理 (10个)**:
+  - Claude Code、Cursor、Codex CLI、opencode、Hermes Agent
+  - Gemini CLI、Antigravity IDE、Kiro、Qoder、Kilo Code
+
+---
+
 ### 0.9.20 (2026-06-30)
-- **新增功能**: 支持 Qoder AI 代理的 MCP 自动配置
-  - **配置路径**: `~/.config/QoderCN/SharedClientCache/mcp.json`
-  - **实现**: 新增 `src/installer/targets/qoder.ts` 模块
-  - **功能**: 
-    - 自动检测 Qoder 是否已安装
-    - 自动写入 CodeGraph MCP 服务器配置
-    - 支持幂等安装（重复运行不会产生重复配置）
-    - 支持卸载（移除 CodeGraph 配置）
+- **重大改进**: 完整实现所有官方支持的 AI 代理 MCP 自动配置
+  - **支持的代理 (9个)**:
+    - **Claude Code**: JSON (~/.claude.json + ~/.claude/settings.json 权限)
+    - **Cursor**: JSON (~/.cursor/mcp.json)
+    - **Codex CLI**: TOML (~/.codex/config.toml)
+    - **opencode**: JSONC (~/.config/opencode/opencode.jsonc)
+    - **Hermes Agent**: YAML (~/.hermes/config.yaml)
+    - **Gemini CLI**: JSON (~/.gemini/settings.json)
+    - **Antigravity IDE**: JSON (~/.gemini/antigravity/mcp_config.json)
+    - **Kiro**: JSON (~/.kiro/config.json)
+    - **Qoder**: JSON (~/.config/QoderCN/SharedClientCache/mcp.json)
+  - **特性**:
+    - 自动检测已安装的代理
+    - 幂等性：重复运行不会产生重复配置
+    - 最小侵入：只添加/更新 codegraph 配置，保留其他配置
+    - 原子写入：防止文件损坏
+    - Claude Code 自动添加工具权限
   - **变更文件**:
-    - `src/installer/targets/qoder.ts` — 新增 Qoder target 实现
-    - `src/installer/targets/registry.ts` — 注册 qoderTarget
-    - `src/installer/targets/types.ts` — 添加 'qoder' 到 TargetId 联合类型
-    - `package.json` — 版本升级到 0.9.20
+    - `vscode-extension/src/agentConfig.ts` — 完全重写，直接写入配置文件
+    - `vscode-extension/src/i18n.ts` — 添加新翻译键
+    - `vscode-extension/package.json` — 版本 0.9.20
 
 ---
 
