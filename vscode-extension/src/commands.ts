@@ -548,24 +548,43 @@ async function getSymbolAtCursor(): Promise<string | null> {
     /[a-zA-Z_$][\w$]*(?:\.[a-zA-Z_$][\w$]*)*/
   );
 
+  // 先取光标处的裸词，用于判断用户实际指向哪一段（Fix#2）
+  const wordRange = editor.document.getWordRangeAtPosition(position);
+  if (!wordRange) return null;
+  const cursorWord = editor.document.getText(wordRange);
+
   if (qualifiedRange) {
     const qualifiedName = editor.document.getText(qualifiedRange);
-    // If we got something with a dot, use the qualified form
     if (qualifiedName && qualifiedName.includes('.')) {
-      // Return just the last part after the final dot for codegraph lookup
-      // CodeGraph indexes symbols by their short name, not qualified name
       const parts = qualifiedName.split('.');
-      return parts[parts.length - 1];
+      const lastPart = parts[parts.length - 1];
+      const firstPart = parts[0];
+
+      // Fix#2-a: 光标在非末段（如 obj.method 的 obj 上）时，返回光标实际指向的裸词，
+      // 而非误返回末段 method。旧实现一律返回末段，导致光标在接收者上时查到错误符号。
+      if (cursorWord && cursorWord !== lastPart) {
+        return cursorWord;
+      }
+
+      // Fix#2-b: 接收者以 PascalCase 开头（如 Class.method）时，返回完整限定名。
+      // CodeGraph 的 matchesSymbol 支持按 Class::method 后缀精确消歧（见 src/mcp/tools.ts），
+      // 这正是 Bug #9 修复的本意--对重名方法用类名限定提升精度。
+      // 用 /^[A-Z][a-z]/ 排除 SCREAMING_SNAKE 常量（如 USER_SERVICE）与单字母大写。
+      if (/^[A-Z][a-z]/.test(firstPart)) {
+        return qualifiedName;
+      }
+
+      // Fix#2-c: 接收者像变量（小写开头，如 obj.method）：限定名 obj.method 无法匹配
+      // Class::method，会让 callers/callees 回退到首个结果（丢失其他同名重载）。
+      // 返回裸名 lastPart 可聚合所有同名符号，覆盖面更广、更稳妥。
+      return lastPart;
     }
-    // If no dot, it's just a regular word — still valid
+    // 无点号：普通裸词
     if (qualifiedName) return qualifiedName;
   }
 
-  // Strategy 2: Fall back to bare word detection
-  const wordRange = editor.document.getWordRangeAtPosition(position);
-  if (!wordRange) return null;
-
-  return editor.document.getText(wordRange);
+  // Strategy 2: 回落到光标处裸词
+  return cursorWord;
 }
 
 /**

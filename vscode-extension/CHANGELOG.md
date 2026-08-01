@@ -5,6 +5,43 @@
 
 ---
 
+### 0.9.24 (2026-08-02)
+- **代码审查修复 7 个 bug**（3 major + 4 minor，经双子代理交叉验证）
+  - **Fix#4 (major)** `McpClient` 的 `close` 处理器补 `else` 兜底：进程在握手完成前以 `code=0` 干净退出时，原三个分支均不命中，挂起的 `initialize` 请求永不 reject，`start()` 无超时兜底导致永久挂起。现补 `else { rejectPending(...) }`，由 `start()` reject 走重试逻辑，避免误报崩溃。
+  - **Fix#7 (major)** `configureHermes` 改为真正 upsert：旧实现对非标准 `command`（如绝对路径）的不变性检查失败后无条件追加，产生重复/畸形 `mcp_servers:` YAML 块且每次累积。现改为定位并就地替换 codegraph 块，保留同级其他服务器，幂等。
+  - **Fix#2 (major)** `getSymbolAtCursor` 修复限定名逻辑：旧实现一律返回限定名末段，丢弃类名限定（与 Bug #9 文档意图矛盾），且光标在接收者 `obj` 上时误返回 `method`。现：光标在非末段返回光标裸词；接收者为 PascalCase（如 `Class.method`）时返回完整限定名（CodeGraph `matchesSymbol` 支持按 `Class::method` 后缀精确消歧）；接收者像变量则返回裸名聚合所有同名重载。
+  - **Fix#1 (minor)** `promptInitialize` 改用现成 i18n 键 `prompt.initQuestion`，去掉硬编码中文 `' 是否立即建立索引？'`（原为未使用的死键），英文用户不再看到中英混杂文案。
+  - **Fix#3 (minor)** `parseFilePaths` 去掉 `includes('/')||includes('.')` 过激过滤，该启发式会滤掉根目录无扩展名文件（`Makefile`/`Dockerfile`/`LICENSE`）。flat 格式下每个 `- ` 行都是真实路径，仅排除空串即可。
+  - **Fix#5 (minor)** `configureAgentsManual` 去重复通知：`silent=false` 时 `configureAgents` 已自行显示「已配置」消息，移除外层重复的 `showInformationMessage`。
+  - **Fix#6 (minor)** `onCrash` 增加 `signal` 参数：被信号终止时 `code` 为 null，原传 `null` 导致用户看到「code null」丢失真实信号（如 SIGKILL）。现传入 signal，文案显示「signal SIGKILL」。`connect.crashed` i18n 文案相应调整为通用 `{0}`。
+- **变更文件**:
+  - `vscode-extension/src/mcpClient.ts` - Fix#4 (else 兜底) + Fix#6 (onCrash 签名/调用)
+  - `vscode-extension/src/agentConfig.ts` - Fix#7 (configureHermes upsert，移除未用的 buildYamlMcpBlock)
+  - `vscode-extension/src/commands.ts` - Fix#2 (getSymbolAtCursor 限定名)
+  - `vscode-extension/src/codegraphManager.ts` - Fix#1 (promptInitialize i18n) + Fix#5 (去重复通知) + Fix#6 (onCrash handler)
+  - `vscode-extension/src/treeProvider.ts` - Fix#3 (parseFilePaths 过滤)
+  - `vscode-extension/src/i18n.ts` - Fix#6 (connect.crashed 文案)
+  - `vscode-extension/package.json` - 版本 0.9.23 -> 0.9.24
+
+---
+
+### 0.9.23 (2026-08-02)
+- 新增 Trae IDE MCP 自动配置支持
+  - 配置路径（自动解析两种发行形态）:
+    - SOLO/服务端形态: `~/.trae-server/data/Machine/mcp.json`（实测本机形态）
+    - 标准桌面版: 平台相关 `Trae/User/mcp.json`（Linux: `~/.config/Trae/User/mcp.json`；macOS: `~/Library/Application Support/Trae/User/mcp.json`；Windows: `%APPDATA%\Trae\User\mcp.json`）
+  - 使用 `mcpServers` 键（与 Cursor/Claude 一致），复用 `MCP_SERVER_CONFIG`
+  - 安装检测: 标记目录 `~/.trae`、`~/.trae-server` 或平台桌面版 `Trae` 目录
+- **支持的代理 (11个)**:
+  - Claude Code、Cursor、Codex CLI、opencode、Hermes Agent
+  - Gemini CLI、Antigravity IDE、Kiro、Qoder、Kilo Code、Trae IDE
+- **变更文件**:
+  - `vscode-extension/src/agentConfig.ts` - 新增 `getTraeConfigPath`/`configureTrae`/`isTraeInstalled`，注册到 `getAgentConfigs`
+  - `vscode-extension/src/i18n.ts` - `agentConfig.noAgents` 文案加入 Trae
+  - `vscode-extension/package.json` - 版本 0.9.22 -> 0.9.23
+
+---
+
 ### 0.9.22 (2026-06-30)
 - 正式支持 Kilo Code MCP 自动配置
   - 配置路径: `~/.config/kilo/kilo.jsonc` (全局)

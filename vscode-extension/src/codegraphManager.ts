@@ -332,11 +332,10 @@ export class CodeGraphManager implements vscode.Disposable {
       return;
     }
 
-    const result = await configureAgents(codegraphPath, this.buildSpawnEnv(), false);
-    if (result.alreadyConfigured) {
-      vscode.window.showInformationMessage(result.message);
-    }
-    // configureAgents already shows success/warning messages
+    // Fix#5: silent=false 时 configureAgents 内部已处理全部用户提示
+    // （成功/部分失败/已配置/未检测到代理）。此处不再重复 showInformationMessage，
+    // 否则「已配置」场景下同一条消息会弹两次。
+    await configureAgents(codegraphPath, this.buildSpawnEnv(), false);
   }
 
   /** Dispose all resources (called on extension deactivation) */
@@ -553,11 +552,14 @@ export class CodeGraphManager implements vscode.Disposable {
 
     // Bug #4 fix: Register crash callback so we transition to 'error' state
     // when the MCP process dies unexpectedly (e.g., segfault, OOM kill)
-    this.client.onCrash = (code: number | null) => {
-      console.error(`[CodeGraph] MCP process crashed with exit code ${code}`);
+    // Fix#6: onCrash 现接收 signal；被信号终止时 code 为 null，需用 signal 名展示，
+    // 否则用户会看到无意义的 "code null"，丢失真实信号（如 SIGKILL）信息。
+    this.client.onCrash = (code: number | null, signal: NodeJS.Signals | null) => {
+      const detail = code !== null ? `code ${code}` : `signal ${signal ?? 'null'}`;
+      console.error(`[CodeGraph] MCP process crashed (${detail})`);
       this.setState('error');
       vscode.window.showErrorMessage(
-        t('connect.crashed', code ?? 'null')
+        t('connect.crashed', detail)
       );
     };
 
@@ -881,9 +883,10 @@ export class CodeGraphManager implements vscode.Disposable {
    * because the user may want to keep working without initializing.
    */
   private promptInitialize(): void {
+    // Fix#1: 改用现成的 i18n 键 prompt.initQuestion，避免硬编码中文导致英文用户看到中英混杂文案。
     vscode.window
       .showInformationMessage(
-        t('sidebar.notInitialized') + ' 是否立即建立索引？',
+        t('prompt.initQuestion'),
         t('confirm.yes'),
         t('confirm.cancel')
       )

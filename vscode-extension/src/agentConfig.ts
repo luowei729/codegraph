@@ -13,6 +13,7 @@
  * - Antigravity IDE: JSON 格式 (~/.gemini/antigravity/mcp_config.json)
  * - Kiro: JSON 格式 (~/.kiro/config.json)
  * - Qoder: JSON 格式 (~/.config/QoderCN/SharedClientCache/mcp.json)
+ * - Trae IDE: JSON 格式 (SOLO: ~/.trae-server/data/Machine/mcp.json；桌面版: 平台相关 Trae/User/mcp.json)
  *
  * 设计原则：
  * - 幂等性：重复运行不会产生重复配置
@@ -245,23 +246,6 @@ function upsertTomlTable(content: string, header: string, tableBlock: string): {
 }
 
 /**
- * 构建 YAML MCP 服务器配置块
- */
-function buildYamlMcpBlock(): string[] {
-  return [
-    'mcp_servers:',
-    '  codegraph:',
-    '    command: codegraph',
-    '    args:',
-    '      - serve',
-    '      - --mcp',
-    '    timeout: 120',
-    '    connect_timeout: 60',
-    '    enabled: true',
-  ];
-}
-
-/**
  * 配置 Claude Code
  */
 function configureClaudeCode(): { action: 'created' | 'updated' | 'unchanged'; success: boolean; error?: string } {
@@ -423,43 +407,81 @@ function configureHermes(): { action: 'created' | 'updated' | 'unchanged'; succe
     }
     
     const existing = fs.existsSync(configPath) ? fs.readFileSync(configPath, 'utf-8') : '';
-    const mcpBlock = buildYamlMcpBlock().join('\n');
-    
-    // 检查是否已配置
-    if (existing.includes('mcp_servers:') && existing.includes('codegraph:')) {
-      // 检查内容是否相同
-      const lines = existing.split('\n');
-      let inMcpServers = false;
-      let inCodegraph = false;
-      const existingBlock: string[] = [];
-      
-      for (const line of lines) {
-        if (line.trim() === 'mcp_servers:') {
-          inMcpServers = true;
-          continue;
-        }
-        if (inMcpServers && line.trim() === 'codegraph:') {
-          inCodegraph = true;
-          continue;
-        }
-        if (inCodegraph) {
-          if (line.trim() && !line.startsWith(' ') && !line.startsWith('\t')) {
-            break;
-          }
-          existingBlock.push(line);
-        }
+
+    // codegraph 子块（2 空格缩进，挂在 mcp_servers: 下）。
+    // Fix#7: 不再无条件追加完整 mcp_servers 块，改为真正的 upsert：
+    // 已有 codegraph 块则就地替换，避免非标准 command（如绝对路径）时产生重复 mcp_servers 块。
+    const codegraphLines = [
+      '  codegraph:',
+      '    command: codegraph',
+      '    args:',
+      '      - serve',
+      '      - --mcp',
+      '    timeout: 120',
+      '    connect_timeout: 60',
+      '    enabled: true',
+    ];
+    const desiredBlock = codegraphLines.join('\n');
+
+    const lines = existing.split('\n');
+    let mcpServersIdx = -1; // 第一个顶层 mcp_servers: 行号
+    let codegraphStart = -1; // 已有 codegraph: 块起始行号
+    let codegraphEnd = -1; // 已有 codegraph: 块结束行号（不含）
+
+    // 1) 定位第一个顶层 mcp_servers: 键，以及其下的 codegraph: 子块
+    for (let i = 0; i < lines.length; i++) {
+      const trimmed = lines[i].trim();
+      if (mcpServersIdx === -1 && trimmed === 'mcp_servers:' && !lines[i].startsWith(' ')) {
+        mcpServersIdx = i;
+        continue;
       }
-      
-      // 如果已存在相同配置，返回 unchanged
-      if (existingBlock.some(l => l.includes('command: codegraph'))) {
-        return { action: 'unchanged', success: true };
+      // 在 mcp_servers: 之后寻找 2 空格缩进的 codegraph: 子键
+      if (mcpServersIdx !== -1 && codegraphStart === -1 &&
+          trimmed === 'codegraph:' && lines[i].startsWith('  ') && !lines[i].startsWith('   ')) {
+        codegraphStart = i;
+        codegraphEnd = i + 1;
+        // 收集该块所有 4 空格缩进的子行。空行或同级/更浅缩进行均视为块结束--
+        // 不跳过空行：否则会把块尾空行计入比较，导致内容相同却误判为 updated。
+        while (codegraphEnd < lines.length) {
+          const ln = lines[codegraphEnd];
+          if (ln.trim() === '' || !ln.startsWith('    ')) break;
+          codegraphEnd++;
+        }
+        break;
       }
     }
-    
-    // 追加 MCP 配置
-    const newContent = existing.trimEnd() + '\n\n' + mcpBlock + '\n';
+
+    // 2) 已有 codegraph 块：比较内容，相同则 unchanged，不同则就地替换
+    if (codegraphStart !== -1) {
+      const existingBlock = lines.slice(codegraphStart, codegraphEnd).join('\n');
+      if (existingBlock === desiredBlock) {
+        return { action: 'unchanged', success: true };
+      }
+      const newLines = [
+        ...lines.slice(0, codegraphStart),
+        ...codegraphLines,
+        ...lines.slice(codegraphEnd),
+      ];
+      atomicWriteFileSync(configPath, newLines.join('\n'));
+      return { action: 'updated', success: true };
+    }
+
+    // 3) 有 mcp_servers: 但无 codegraph：在其后插入 codegraph 子块
+    if (mcpServersIdx !== -1) {
+      const newLines = [
+        ...lines.slice(0, mcpServersIdx + 1),
+        ...codegraphLines,
+        ...lines.slice(mcpServersIdx + 1),
+      ];
+      atomicWriteFileSync(configPath, newLines.join('\n'));
+      return { action: 'created', success: true };
+    }
+
+    // 4) 无 mcp_servers: 追加完整块
+    const fullBlock = ['mcp_servers:', ...codegraphLines].join('\n');
+    const newContent = existing.trimEnd() + '\n\n' + fullBlock + '\n';
     atomicWriteFileSync(configPath, newContent);
-    
+
     return { action: 'created', success: true };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -614,6 +636,76 @@ function configureKiloCode(): { action: 'created' | 'updated' | 'unchanged'; suc
 }
 
 /**
+ * 解析 Trae IDE 全局 MCP 配置文件路径
+ *
+ * Trae IDE 有两种发行形态，配置目录约定不同（实测本机为 SOLO/服务端形态）：
+ * 1. SOLO/服务端形态：数据目录在 ~/.trae-server，MCP 配置位于
+ *    data/Machine/mcp.json（Machine 级配置，对整台机器生效）。
+ * 2. 标准桌面版：跟随 VS Code 的 userData 目录约定：
+ *    - Windows: %APPDATA%\Trae\User\mcp.json
+ *    - macOS:   ~/Library/Application Support/Trae/User/mcp.json
+ *    - Linux:   ~/.config/Trae/User/mcp.json
+ *
+ * 解析顺序：优先返回已存在的 mcp.json；其次返回父目录已存在的候选
+ * （确保写入用户实际安装的形态）；都不存在时返回 SOLO 形态路径
+ * （writeJsonConfig 会递归创建目录）。
+ */
+function getTraeConfigPath(): string {
+  const homeDir = os.homedir();
+  // 候选路径：SOLO/服务端形态优先（实际运行的形态），其次标准桌面版
+  const candidates: string[] = [
+    path.join(homeDir, '.trae-server', 'data', 'Machine', 'mcp.json'),
+  ];
+  if (process.platform === 'win32') {
+    candidates.push(path.join(process.env.APPDATA || path.join(homeDir, 'AppData', 'Roaming'), 'Trae', 'User', 'mcp.json'));
+  } else if (process.platform === 'darwin') {
+    candidates.push(path.join(homeDir, 'Library', 'Application Support', 'Trae', 'User', 'mcp.json'));
+  } else {
+    candidates.push(path.join(homeDir, '.config', 'Trae', 'User', 'mcp.json'));
+  }
+
+  // 1) 优先使用已存在的 mcp.json，避免写错位置
+  for (const c of candidates) {
+    if (fs.existsSync(c)) return c;
+  }
+  // 2) 其次使用父目录已存在的候选，确保写入用户实际安装的形态
+  for (const c of candidates) {
+    if (fs.existsSync(path.dirname(c))) return c;
+  }
+  // 3) 兜底：返回 SOLO 形态路径（writeJsonConfig 会递归创建目录）
+  return candidates[0];
+}
+
+/**
+ * 配置 Trae IDE（JSON 格式）
+ *
+ * Trae IDE 是基于 VS Code 的 AI IDE，通过 mcp.json 的 mcpServers 键注册 MCP Server，
+ * 与 Cursor/Claude 的结构一致。配置路径由 getTraeConfigPath() 统一解析。
+ * 复用 MCP_SERVER_CONFIG，配合 deepEqual 保证幂等。
+ */
+function configureTrae(): { action: 'created' | 'updated' | 'unchanged'; success: boolean; error?: string } {
+  try {
+    const mcpPath = getTraeConfigPath();
+    const config = readJsonConfig(mcpPath);
+    const existing = config.mcpServers?.codegraph;
+
+    // 与其他 JSON 代理共用 MCP_SERVER_CONFIG，deepEqual 保证重复运行不产生重复配置
+    if (!deepEqual(existing, MCP_SERVER_CONFIG)) {
+      if (!config.mcpServers) config.mcpServers = {};
+      config.mcpServers.codegraph = MCP_SERVER_CONFIG;
+      writeJsonConfig(mcpPath, config);
+
+      return { action: existing ? 'updated' : 'created', success: true };
+    }
+
+    return { action: 'unchanged', success: true };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return { action: 'created', success: false, error: msg };
+  }
+}
+
+/**
  * 检测代理是否已安装
  */
 function isClaudeCodeInstalled(): boolean {
@@ -672,6 +764,24 @@ function isKiloCodeInstalled(): boolean {
   return fs.existsSync(path.join(homeDir, '.config', 'kilo'));
 }
 
+function isTraeInstalled(): boolean {
+  const homeDir = os.homedir();
+  // Trae IDE 标记目录：SOLO/服务端形态用 ~/.trae 与 ~/.trae-server，桌面版用平台 userData 目录
+  const markers: string[] = [
+    path.join(homeDir, '.trae'),         // Trae 内置资源/运行时目录
+    path.join(homeDir, '.trae-server'),  // Trae SOLO/服务端数据目录
+  ];
+  if (process.platform === 'win32') {
+    markers.push(path.join(process.env.APPDATA || path.join(homeDir, 'AppData', 'Roaming'), 'Trae'));
+  } else if (process.platform === 'darwin') {
+    markers.push(path.join(homeDir, 'Library', 'Application Support', 'Trae'));
+  } else {
+    markers.push(path.join(homeDir, '.config', 'Trae'));
+  }
+  // 任一标记目录存在即视为已安装
+  return markers.some(p => fs.existsSync(p));
+}
+
 /**
  * 获取所有支持的代理配置
  */
@@ -726,6 +836,11 @@ function getAgentConfigs(): AgentConfig[] {
       name: 'Kilo Code',
       isInstalled: isKiloCodeInstalled,
       configure: configureKiloCode,
+    },
+    {
+      name: 'Trae IDE',
+      isInstalled: isTraeInstalled,
+      configure: configureTrae,
     },
   ];
 }

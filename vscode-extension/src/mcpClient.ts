@@ -95,8 +95,11 @@ export class McpClient {
    * Callback invoked when the MCP server process crashes unexpectedly.
    * Used by CodeGraphManager to transition to 'error' state and attempt recovery.
    * Bug #4 fix: previously the manager had no way to detect process crashes.
+   *
+   * Fix#6: 增加 signal 参数。被信号终止时 code 为 null，仅靠 code 无法区分崩溃原因，
+   * 传入 signal 让上层展示真实信号名（如 SIGKILL），避免显示 "code null"。
    */
-  public onCrash: ((code: number | null) => void) | null = null;
+  public onCrash: ((code: number | null, signal: NodeJS.Signals | null) => void) | null = null;
 
   /**
    * @param command - Absolute path to the codegraph executable
@@ -206,7 +209,8 @@ export class McpClient {
           // Non-zero exit code — abnormal termination
           this.rejectPending(new Error(`CodeGraph process exited with code ${code}`));
           if (this.onCrash) {
-            this.onCrash(code);
+            // Fix#6: 传入 signal，上层可据此展示真实信号名
+            this.onCrash(code, signal);
           }
         } else if (signal) {
           // Bug D fix: Process was killed by a signal (e.g., SIGKILL from OOM killer,
@@ -214,12 +218,19 @@ export class McpClient {
           // This is always abnormal — treat it as a crash.
           this.rejectPending(new Error(`CodeGraph process killed by signal ${signal}`));
           if (this.onCrash) {
-            this.onCrash(code);
+            // Fix#6: 此分支 code 为 null，传入 signal 让上层展示信号名而非 "code null"
+            this.onCrash(code, signal);
           }
         } else if (wasReady) {
           // Clean shutdown (code === 0 or null, no signal) while client was ready.
-          // Likely intentional — extension deactivation called stop().
+          // Likely intentional - extension deactivation called stop().
           this.rejectPending(new Error('CodeGraph process closed'));
+        } else {
+          // Fix#4: 进程在握手完成前关闭（如 code===0 干净退出），上述分支均不命中。
+          // 必须 reject 挂起的 initialize 请求，否则 start() 永久挂起（无超时兜底）。
+          // 不调 onCrash：这是「启动失败」而非「运行中崩溃」，由 start() reject
+          // 触发 CodeGraphManager.handleStartError 的重试逻辑，避免误报崩溃。
+          this.rejectPending(new Error('CodeGraph process exited before handshake completed'));
         }
       });
 

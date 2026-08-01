@@ -399,8 +399,10 @@ export class CodeGraphTreeProvider implements vscode.TreeDataProvider<CodeGraphT
         // Remove any remaining markdown artifacts
         filePath = filePath.replace(/`/g, '').replace(/\*\*/g, '').trim();
 
-        // Only include non-empty paths that look like file paths
-        if (filePath && (filePath.includes('/') || filePath.includes('.'))) {
+        // Fix#3: 仅排除空串。之前的 includes('/')||includes('.') 启发式会滤掉
+        // 根目录无扩展名文件（Makefile/Dockerfile/LICENSE 等既无 '/' 也无 '.'）。
+        // flat 格式下每个 "- " 行都是真实文件路径，无需额外启发式过滤。
+        if (filePath) {
           paths.push(filePath);
         }
       }

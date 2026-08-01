@@ -310,8 +310,9 @@ const messages = {
     zh: 'CodeGraph 启动失败，已重试 {0} 次。错误: {1}',
   },
   'connect.crashed': {
-    en: 'CodeGraph server process exited unexpectedly (code {0}). Click the status bar to retry.',
-    zh: 'CodeGraph 服务进程意外退出（代码 {0}）。点击状态栏重试。',
+    // Fix#6: {0} 现为 detail 字符串（"code N" 或 "signal SIGKILL"），而非仅 code
+    en: 'CodeGraph server process exited unexpectedly ({0}). Click the status bar to retry.',
+    zh: 'CodeGraph 服务进程意外退出（{0}）。点击状态栏重试。',
   },
 
   // ---- 搜索相关 ----
@@ -466,8 +467,8 @@ const messages = {
     zh: '为 AI 代理配置 CodeGraph',
   },
   'agentConfig.noAgents': {
-    en: 'No AI agents detected. Install Claude Code, Cursor, Codex, or Qoder to auto-configure.',
-    zh: '未检测到 AI 代理。安装 Claude Code、Cursor、Codex 或 Qoder 后将自动配置。',
+    en: 'No AI agents detected. Install Claude Code, Cursor, Codex, Trae, or Qoder to auto-configure.',
+    zh: '未检测到 AI 代理。安装 Claude Code、Cursor、Codex、Trae 或 Qoder 后将自动配置。',
   },
 } as const;
 
