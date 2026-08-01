@@ -5,6 +5,25 @@
 
 ---
 
+### 0.9.25 (2026-08-02)
+- 新增 Trae CN IDE（国内版）MCP 自动配置支持
+  - Trae CN 是 Trae IDE 国内版本，目录约定与国际版完全对称（本机实测验证）
+  - 配置路径（自动解析两种发行形态）:
+    - SOLO/服务端形态: `~/.trae-cn-server/data/Machine/mcp.json`（本机实测形态，Machine 目录已存在）
+    - 标准桌面版: 平台相关 `Trae CN/User/mcp.json`（Linux: `~/.config/Trae CN/User/mcp.json`；macOS: `~/Library/Application Support/Trae CN/User/mcp.json`；Windows: `%APPDATA%\Trae CN\User\mcp.json`）
+  - 使用 `mcpServers` 键（与 Trae 国际版/Cursor/Claude 一致），复用 `MCP_SERVER_CONFIG`
+  - 安装检测: 标记目录 `~/.trae-cn`、`~/.trae-cn-server` 或平台桌面版 `Trae CN` 目录
+  - 与国际版 Trae 独立配置，两者可共存互不干扰
+- **支持的代理 (12个)**:
+  - Claude Code、Cursor、Codex CLI、opencode、Hermes Agent
+  - Gemini CLI、Antigravity IDE、Kiro、Qoder、Kilo Code、Trae IDE、Trae CN IDE
+- **变更文件**:
+  - `vscode-extension/src/agentConfig.ts` - 新增 `getTraeCnConfigPath`/`configureTraeCn`/`isTraeCnInstalled`，注册到 `getAgentConfigs`，头注释补充
+  - `vscode-extension/src/i18n.ts` - `agentConfig.noAgents` 文案加入 Trae CN
+  - `vscode-extension/package.json` - 版本 0.9.24 -> 0.9.25
+
+---
+
 ### 0.9.24 (2026-08-02)
 - **代码审查修复 7 个 bug**（3 major + 4 minor，经双子代理交叉验证）
   - **Fix#4 (major)** `McpClient` 的 `close` 处理器补 `else` 兜底：进程在握手完成前以 `code=0` 干净退出时，原三个分支均不命中，挂起的 `initialize` 请求永不 reject，`start()` 无超时兜底导致永久挂起。现补 `else { rejectPending(...) }`，由 `start()` reject 走重试逻辑，避免误报崩溃。

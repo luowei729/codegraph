@@ -467,8 +467,8 @@ const messages = {
     zh: '为 AI 代理配置 CodeGraph',
   },
   'agentConfig.noAgents': {
-    en: 'No AI agents detected. Install Claude Code, Cursor, Codex, Trae, or Qoder to auto-configure.',
-    zh: '未检测到 AI 代理。安装 Claude Code、Cursor、Codex、Trae 或 Qoder 后将自动配置。',
+    en: 'No AI agents detected. Install Claude Code, Cursor, Codex, Trae, Trae CN, or Qoder to auto-configure.',
+    zh: '未检测到 AI 代理。安装 Claude Code、Cursor、Codex、Trae、Trae CN 或 Qoder 后将自动配置。',
   },
 } as const;
 

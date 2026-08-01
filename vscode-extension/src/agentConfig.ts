@@ -14,6 +14,7 @@
  * - Kiro: JSON 格式 (~/.kiro/config.json)
  * - Qoder: JSON 格式 (~/.config/QoderCN/SharedClientCache/mcp.json)
  * - Trae IDE: JSON 格式 (SOLO: ~/.trae-server/data/Machine/mcp.json；桌面版: 平台相关 Trae/User/mcp.json)
+ * - Trae CN IDE: JSON 格式 (SOLO: ~/.trae-cn-server/data/Machine/mcp.json；桌面版: 平台相关 Trae CN/User/mcp.json)
  *
  * 设计原则：
  * - 幂等性：重复运行不会产生重复配置
@@ -706,6 +707,76 @@ function configureTrae(): { action: 'created' | 'updated' | 'unchanged'; success
 }
 
 /**
+ * 解析 Trae CN IDE（国内版）全局 MCP 配置文件路径
+ *
+ * Trae CN 是 Trae IDE 的国内版本，目录约定与国际版完全对称（本机实测）：
+ * 1. SOLO/服务端形态：数据目录在 ~/.trae-cn-server，MCP 配置位于
+ *    data/Machine/mcp.json（Machine 级配置，对整台机器生效）。
+ * 2. 标准桌面版：跟随 VS Code 的 userData 目录约定（目录名为 "Trae CN"）：
+ *    - Windows: %APPDATA%\Trae CN\User\mcp.json
+ *    - macOS:   ~/Library/Application Support/Trae CN/User/mcp.json
+ *    - Linux:   ~/.config/Trae CN/User/mcp.json
+ *
+ * 解析顺序：优先返回已存在的 mcp.json；其次返回父目录已存在的候选
+ * （确保写入用户实际安装的形态）；都不存在时返回 SOLO 形态路径
+ * （writeJsonConfig 会递归创建目录）。
+ */
+function getTraeCnConfigPath(): string {
+  const homeDir = os.homedir();
+  // 候选路径：SOLO/服务端形态优先（与国际版对称），其次标准桌面版
+  const candidates: string[] = [
+    path.join(homeDir, '.trae-cn-server', 'data', 'Machine', 'mcp.json'),
+  ];
+  if (process.platform === 'win32') {
+    candidates.push(path.join(process.env.APPDATA || path.join(homeDir, 'AppData', 'Roaming'), 'Trae CN', 'User', 'mcp.json'));
+  } else if (process.platform === 'darwin') {
+    candidates.push(path.join(homeDir, 'Library', 'Application Support', 'Trae CN', 'User', 'mcp.json'));
+  } else {
+    candidates.push(path.join(homeDir, '.config', 'Trae CN', 'User', 'mcp.json'));
+  }
+
+  // 1) 优先使用已存在的 mcp.json，避免写错位置
+  for (const c of candidates) {
+    if (fs.existsSync(c)) return c;
+  }
+  // 2) 其次使用父目录已存在的候选，确保写入用户实际安装的形态
+  for (const c of candidates) {
+    if (fs.existsSync(path.dirname(c))) return c;
+  }
+  // 3) 兜底：返回 SOLO 形态路径（writeJsonConfig 会递归创建目录）
+  return candidates[0];
+}
+
+/**
+ * 配置 Trae CN IDE（国内版，JSON 格式）
+ *
+ * Trae CN 与国际版 Trae 同为基于 VS Code 的 AI IDE，MCP 配置结构一致，
+ * 均通过 mcp.json 的 mcpServers 键注册 MCP Server。配置路径由
+ * getTraeCnConfigPath() 统一解析。复用 MCP_SERVER_CONFIG，配合 deepEqual 保证幂等。
+ */
+function configureTraeCn(): { action: 'created' | 'updated' | 'unchanged'; success: boolean; error?: string } {
+  try {
+    const mcpPath = getTraeCnConfigPath();
+    const config = readJsonConfig(mcpPath);
+    const existing = config.mcpServers?.codegraph;
+
+    // 与其他 JSON 代理共用 MCP_SERVER_CONFIG，deepEqual 保证重复运行不产生重复配置
+    if (!deepEqual(existing, MCP_SERVER_CONFIG)) {
+      if (!config.mcpServers) config.mcpServers = {};
+      config.mcpServers.codegraph = MCP_SERVER_CONFIG;
+      writeJsonConfig(mcpPath, config);
+
+      return { action: existing ? 'updated' : 'created', success: true };
+    }
+
+    return { action: 'unchanged', success: true };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return { action: 'created', success: false, error: msg };
+  }
+}
+
+/**
  * 检测代理是否已安装
  */
 function isClaudeCodeInstalled(): boolean {
@@ -782,6 +853,24 @@ function isTraeInstalled(): boolean {
   return markers.some(p => fs.existsSync(p));
 }
 
+function isTraeCnInstalled(): boolean {
+  const homeDir = os.homedir();
+  // Trae CN IDE（国内版）标记目录：与国际版对称
+  const markers: string[] = [
+    path.join(homeDir, '.trae-cn'),         // Trae CN 内置资源/运行时目录
+    path.join(homeDir, '.trae-cn-server'),  // Trae CN SOLO/服务端数据目录
+  ];
+  if (process.platform === 'win32') {
+    markers.push(path.join(process.env.APPDATA || path.join(homeDir, 'AppData', 'Roaming'), 'Trae CN'));
+  } else if (process.platform === 'darwin') {
+    markers.push(path.join(homeDir, 'Library', 'Application Support', 'Trae CN'));
+  } else {
+    markers.push(path.join(homeDir, '.config', 'Trae CN'));
+  }
+  // 任一标记目录存在即视为已安装
+  return markers.some(p => fs.existsSync(p));
+}
+
 /**
  * 获取所有支持的代理配置
  */
@@ -841,6 +930,11 @@ function getAgentConfigs(): AgentConfig[] {
       name: 'Trae IDE',
       isInstalled: isTraeInstalled,
       configure: configureTrae,
+    },
+    {
+      name: 'Trae CN IDE',
+      isInstalled: isTraeCnInstalled,
+      configure: configureTraeCn,
     },
   ];
 }
