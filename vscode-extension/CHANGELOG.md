@@ -5,22 +5,30 @@
 
 ---
 
-### 0.9.25 (2026-08-02)
-- 新增 Trae CN IDE（国内版）MCP 自动配置支持
-  - Trae CN 是 Trae IDE 国内版本，目录约定与国际版完全对称（本机实测验证）
-  - 配置路径（自动解析两种发行形态）:
-    - SOLO/服务端形态: `~/.trae-cn-server/data/Machine/mcp.json`（本机实测形态，Machine 目录已存在）
-    - 标准桌面版: 平台相关 `Trae CN/User/mcp.json`（Linux: `~/.config/Trae CN/User/mcp.json`；macOS: `~/Library/Application Support/Trae CN/User/mcp.json`；Windows: `%APPDATA%\Trae CN\User\mcp.json`）
-  - 使用 `mcpServers` 键（与 Trae 国际版/Cursor/Claude 一致），复用 `MCP_SERVER_CONFIG`
-  - 安装检测: 标记目录 `~/.trae-cn`、`~/.trae-cn-server` 或平台桌面版 `Trae CN` 目录
-  - 与国际版 Trae 独立配置，两者可共存互不干扰
-- **支持的代理 (12个)**:
-  - Claude Code、Cursor、Codex CLI、opencode、Hermes Agent
-  - Gemini CLI、Antigravity IDE、Kiro、Qoder、Kilo Code、Trae IDE、Trae CN IDE
+### 0.9.26 (2026-08-02)
+- 变更记录与代码注释文案精简
+  - 去除地区性/非正式表述，适配扩展商店审核要求
+  - 涉及 `agentConfig.ts` 中 Trae CN 相关注释、`CHANGELOG.md`
+  - 保留 "Trae CN" 产品名，仅清理描述性地区文案
 - **变更文件**:
-  - `vscode-extension/src/agentConfig.ts` - 新增 `getTraeCnConfigPath`/`configureTraeCn`/`isTraeCnInstalled`，注册到 `getAgentConfigs`，头注释补充
-  - `vscode-extension/src/i18n.ts` - `agentConfig.noAgents` 文案加入 Trae CN
-  - `vscode-extension/package.json` - 版本 0.9.24 -> 0.9.25
+  - `src/agentConfig.ts` - Trae CN 相关注释文案精简
+  - `CHANGELOG.md` - 0.9.25 条目精简
+  - `package.json` - 版本 0.9.25 -> 0.9.26
+
+---
+
+### 0.9.25 (2026-08-02)
+- 新增 Trae CN IDE MCP 自动配置支持
+  - 配置路径（自动解析两种发行形态）:
+    - SOLO/服务端形态: `~/.trae-cn-server/data/Machine/mcp.json`
+    - 桌面版: 平台相关 `Trae CN/User/mcp.json`（Linux / macOS / Windows）
+  - 使用 `mcpServers` 键，复用 `MCP_SERVER_CONFIG`，与 Trae IDE 独立配置、可共存
+  - 安装检测: `~/.trae-cn`、`~/.trae-cn-server` 或平台 `Trae CN` 目录
+- **支持的代理 (12个)**: Claude Code、Cursor、Codex CLI、opencode、Hermes Agent、Gemini CLI、Antigravity IDE、Kiro、Qoder、Kilo Code、Trae IDE、Trae CN IDE
+- **变更文件**:
+  - `src/agentConfig.ts` - 新增 `getTraeCnConfigPath`/`configureTraeCn`/`isTraeCnInstalled` 并注册
+  - `src/i18n.ts` - `agentConfig.noAgents` 文案补充
+  - `package.json` - 版本 0.9.24 -> 0.9.25
 
 ---
 

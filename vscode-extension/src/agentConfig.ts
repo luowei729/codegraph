@@ -707,15 +707,15 @@ function configureTrae(): { action: 'created' | 'updated' | 'unchanged'; success
 }
 
 /**
- * 解析 Trae CN IDE（国内版）全局 MCP 配置文件路径
+ * 解析 Trae CN IDE 全局 MCP 配置文件路径
  *
- * Trae CN 是 Trae IDE 的国内版本，目录约定与国际版完全对称（本机实测）：
+ * Trae CN IDE 目录约定与 Trae IDE 对称：
  * 1. SOLO/服务端形态：数据目录在 ~/.trae-cn-server，MCP 配置位于
  *    data/Machine/mcp.json（Machine 级配置，对整台机器生效）。
  * 2. 标准桌面版：跟随 VS Code 的 userData 目录约定（目录名为 "Trae CN"）：
  *    - Windows: %APPDATA%\Trae CN\User\mcp.json
  *    - macOS:   ~/Library/Application Support/Trae CN/User/mcp.json
- *    - Linux:   ~/.config/Trae CN/User/mcp.json
+ *    - Linux:   ~/.config/Trae CN\User/mcp.json
  *
  * 解析顺序：优先返回已存在的 mcp.json；其次返回父目录已存在的候选
  * （确保写入用户实际安装的形态）；都不存在时返回 SOLO 形态路径
@@ -723,7 +723,7 @@ function configureTrae(): { action: 'created' | 'updated' | 'unchanged'; success
  */
 function getTraeCnConfigPath(): string {
   const homeDir = os.homedir();
-  // 候选路径：SOLO/服务端形态优先（与国际版对称），其次标准桌面版
+  // 候选路径：SOLO/服务端形态优先（与 Trae IDE 对称），其次标准桌面版
   const candidates: string[] = [
     path.join(homeDir, '.trae-cn-server', 'data', 'Machine', 'mcp.json'),
   ];
@@ -748,9 +748,9 @@ function getTraeCnConfigPath(): string {
 }
 
 /**
- * 配置 Trae CN IDE（国内版，JSON 格式）
+ * 配置 Trae CN IDE（JSON 格式）
  *
- * Trae CN 与国际版 Trae 同为基于 VS Code 的 AI IDE，MCP 配置结构一致，
+ * Trae CN IDE 与 Trae IDE 同为基于 VS Code 的 AI IDE，MCP 配置结构一致，
  * 均通过 mcp.json 的 mcpServers 键注册 MCP Server。配置路径由
  * getTraeCnConfigPath() 统一解析。复用 MCP_SERVER_CONFIG，配合 deepEqual 保证幂等。
  */
@@ -855,7 +855,7 @@ function isTraeInstalled(): boolean {
 
 function isTraeCnInstalled(): boolean {
   const homeDir = os.homedir();
-  // Trae CN IDE（国内版）标记目录：与国际版对称
+  // Trae CN IDE 标记目录：与 Trae IDE 对称
   const markers: string[] = [
     path.join(homeDir, '.trae-cn'),         // Trae CN 内置资源/运行时目录
     path.join(homeDir, '.trae-cn-server'),  // Trae CN SOLO/服务端数据目录
