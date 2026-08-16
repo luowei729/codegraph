@@ -365,10 +365,11 @@ export function registerCommands(
         });
 
         if (selected) {
-          // Find the original parsed symbol by matching label + description
-          const originalSymbol = parsed.find(
-            (s) => s.name === selected.label
-          );
+          // Fix#4: 用索引映射而非 name 匹配。旧逻辑 parsed.find(name === label)
+          // 对同名符号（不同文件的重载/重名函数）永远返回第一个，选中第二条
+          // 也打开错误文件。showQuickPick 返回传入数组的元素引用，indexOf 精确对应。
+          const idx = items.indexOf(selected);
+          const originalSymbol = parsed[idx];
           if (originalSymbol) {
             await openNodeLocation(originalSymbol, manager);
           }
@@ -480,7 +481,10 @@ async function runSymbolQuery(
       return;
     }
 
-    if (text.includes(`No ${displayName.toLowerCase()} found`) || text.includes('No callers') || text.includes('No callees')) {
+    // Fix#8: 删除死代码 `No ${displayName.toLowerCase()} found` —— displayName
+    // 是中文（'调用者'/'被调用者'），服务端输出英文，该判断恒为 false。
+    // 服务端实际输出格式为 "No callers found for ..." / "No callees found for ..."。
+    if (text.includes('No callers') || text.includes('No callees') || text.includes('No impact')) {
       vscode.window.showInformationMessage(t('prompt.noResults'));
       return;
     }
@@ -511,9 +515,9 @@ async function runSymbolQuery(
     });
 
     if (selected) {
-      const originalSymbol = parsed.find(
-        (s) => s.name === selected.label
-      );
+      // Fix#4: 用索引映射而非 name 匹配（同名符号会打开错误文件）
+      const idx = items.indexOf(selected);
+      const originalSymbol = parsed[idx];
       if (originalSymbol) {
         await openNodeLocation(originalSymbol, manager);
       }

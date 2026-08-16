@@ -42,8 +42,8 @@ import { t } from './i18n';
  * Can represent a file, a folder, or a code symbol.
  */
 interface CodeGraphTreeNode {
-  /** Unique identifier for VS Code's tree rendering engine */
-  id: string;
+  /** Unique identifier for VS Code's tree rendering engine（可选：缺省时用 label 定位） */
+  id?: string;
 
   /** Display label */
   label: string;
@@ -220,9 +220,16 @@ export class CodeGraphTreeProvider implements vscode.TreeDataProvider<CodeGraphT
       {
         id: 'search-root',
         label: t('sidebar.searchResults'),
-        collapsibleState: vscode.TreeItemCollapsibleState.Collapsed,
+        // Fix#11: 搜索结果根节点此前是死功能——collapsibleState 为 Collapsed
+        // 但没有任何命令写入 children，用户展开永远是空。现在改为不可展开
+        // （None），点击直接触发符号搜索命令，与侧边栏搜索按钮行为一致。
+        collapsibleState: vscode.TreeItemCollapsibleState.None,
         iconPath: new vscode.ThemeIcon('search'),
         tooltip: t('sidebar.recentSearches'),
+        command: {
+          command: 'codegraph.searchSymbol',
+          title: t('action.search'),
+        },
       },
     ];
   }
@@ -486,10 +493,13 @@ export class CodeGraphTreeProvider implements vscode.TreeDataProvider<CodeGraphT
 
   /**
    * Create a single error/info node for the tree.
+   *
+   * Fix#9: 不设置固定 id（'tree-error'）。VS Code tree 要求节点 id 在
+   * 同一父级下唯一，固定 id 会让多个错误节点（如文件/符号同时加载失败）
+   * 渲染冲突。不设 id 时 VS Code 用 label 自动定位，无需唯一性保证。
    */
   private createErrorNode(message: string): CodeGraphTreeNode[] {
     return [{
-      id: 'tree-error',
       label: message,
       collapsibleState: vscode.TreeItemCollapsibleState.None,
       iconPath: new vscode.ThemeIcon('info'),

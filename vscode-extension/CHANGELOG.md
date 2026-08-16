@@ -5,6 +5,92 @@
 
 ---
 
+### 0.9.32 (2026-08-17)
+- 修复「建立索引」在文件监视禁用环境下永久挂起（严重）
+  - 根因：`codegraph init` 索引完成后调用 `offerWatchFallback`，在 git 仓库且文件监视被禁用（WSL2 `/mnt/*` 项目、`CODEGRAPH_NO_WATCH=1`）时弹出 `clack.select` 交互选择（"如何保持索引新鲜？"）。扩展以管道 stdin（非 TTY）spawn 子进程，clack.select 在非 TTY 下**永久挂起**等待按键（实测 8s+ 不返回、进程不退出），「建立索引」永久卡死
+  - 修复：`runCliCommand` 改用管道 stdin，spawn 3 秒后注入回车（`\r`）并关闭 stdin（`end()` 模拟 EOF）--回车让 clack.select 接受默认推荐项（安装 git hooks），EOF 让流程走完后进程正常退出。仅注入回车不够：clack 的 keypress 监听会保持事件循环活跃，进程完成输出后仍不退出
+  - 端到端实测：init 3s 干净退出、git hooks（post-commit/post-merge/post-checkout）正确安装、`sync` 等无交互命令不受回车+EOF 影响
+  - 同时为 `runCliCommand` 增加 120s 总超时兜底（SIGKILL + reject），任何 CLI 子进程异常（挂起、损坏、死锁）不再让 UI 永久卡死
+- **变更文件**:
+  - `src/codegraphManager.ts` - `runCliCommand` 管道 stdin + 3s 注入回车/EOF + 120s 超时 + settle 去重
+  - `package.json` - 版本 0.9.31 -> 0.9.32
+
+---
+- 交叉重新审查修复 3 个数据保护/进程生命周期 bug（0.9.30 修复的完整性补充）
+  - **`configureKiloCode` 数据丢失（与 opencode 同模式）**: `kilo.jsonc` 是 JSONC 格式，旧逻辑用 `readJsonConfig`（JSON.parse）解析失败返回 `{}`，覆盖写入清空用户 Kilo Code 配置。改用 `readJsoncConfig` + null 保护
+  - **通用损坏保护**: `readJsonConfig` 解析失败从返回 `{}` 改为返回 `null`（文件不存在/空白仍返回 `{}` 以支持新建），全部 12 处代理配置调用点（Claude/Cursor/Gemini/Antigravity/Kiro/Qoder/Trae/Trae CN/VS Code）在 null 时放弃写入——文件损坏（半写状态、手误）不再被整体覆盖，用户数据得以保留
+  - **`McpClient.stop()` SIGKILL 兜底失效**: `proc.killed` 是"kill() 已被调用"标志（SIGTERM 后立即变 true）而非"进程已死"，子进程忽略 SIGTERM 时 5s 后的 SIGKILL 兜底永不触发，留下孤儿进程。改用 `exitCode === null && signalCode === null` 判断进程存活
+  - 语义修正: 所有 configure 函数失败路径的 action 从误导性的 `'created'` 统一为 `'unchanged'`
+- **变更文件**:
+  - `src/agentConfig.ts` - readJsonConfig 返回 null + configReadError 助手、configureKiloCode 换 readJsoncConfig、12 处调用点 null 保护、catch action 统一
+  - `src/mcpClient.ts` - stop() 存活判断改 exitCode/signalCode
+  - `package.json` - 版本 0.9.30 -> 0.9.31
+
+---
+- 全面修复代码审查发现的 12 个 bug
+  - **数据保护（严重）**: `configureOpencode` 解析 opencode.jsonc 失败时不再整体覆盖写入（旧逻辑用 JSON.parse 读 JSONC 失败→读到空对象→JSON.stringify 清空用户全部配置）。新增零依赖 `stripJsonc`（状态机剥离注释/尾逗号，字符串内字符不误伤）与 `readJsoncConfig`；解析失败返回 null 并放弃写入
+  - **重试失效（高）**: 状态栏「重试连接」永久失效。`startCodeGraph` 拆分为公开入口（重置 retryCount）+ 内部 `doStartCodeGraph`（自动重试递归不重置）；重试边界 `< maxRetries` 改为 `<= maxRetries`，与 2s/4s/8s 注释一致
+  - `findCodeGraphCommand` Windows 下 `where` 多行输出取第一行（旧逻辑多行整体传给 existsSync 恒 false，误判未安装触发多余自动安装）
+  - 同名符号（不同文件重载/重名）在搜索/调用者/被调用者/影响分析 QuickPick 中用索引映射匹配，修复选中第二条也打开错误文件
+  - MCP initialize 握手上报真实扩展版本号（从 `context.extension.packageJSON` 读取，替代硬编码 0.9.9）
+  - MCP 进程崩溃后同步重置 `codegraph:ready` 上下文，命令面板 4 个命令不再残留显示
+  - 自动安装（standalone installer / npm）增加 120s 超时，网络挂起不再卡死「正在安装」
+  - 删除 `No ${displayName.toLowerCase()} found` 死代码（displayName 为中文、服务端输出英文，恒 false）
+  - TreeView 错误节点不再使用固定 id（`tree-error`），避免多个错误节点 id 冲突
+  - `configureClaudeCode` 权限列表补齐与 MCP 配置解耦（旧逻辑只在 mcpServers 变更时补权限），缺权限的存量用户现在也能补上
+  - TreeView「搜索结果」根节点接入 `codegraph.searchSymbol` 命令（旧逻辑永远为空，死功能）
+  - `configureHermes` 的 command 使用 codegraphPath 绝对路径（与 VS Code 同理，避免 Hermes spawn ENOENT）
+- **变更文件**:
+  - `src/agentConfig.ts` - stripJsonc/readJsoncConfig 新增、configureOpencode 数据保护、configureClaudeCode 权限幂等、configureHermes 绝对路径
+  - `src/codegraphManager.ts` - startCodeGraph 拆分、handleStartError 边界、onCrash 上下文重置、where 多行、安装超时
+  - `src/mcpClient.ts` - clientVersion 参数化
+  - `src/commands.ts` - 索引映射匹配、删除死代码
+  - `src/treeProvider.ts` - 错误节点 id 可选、search-root 接入搜索命令
+  - `package.json` - 版本 0.9.29 -> 0.9.30
+
+---
+
+### 0.9.29 (2026-08-16)
+- 修复 VS Code Chat MCP 服务器启动失败（spawn codegraph ENOENT）
+  - 根因：VS Code Server 进程（Remote-SSH / Agent Host）的 PATH 不含 `~/.local/bin`（shell 配置仅在交互/登录 shell 生效），而 MCP 配置中的 command 为裸命令 `codegraph`，导致 spawn 找不到可执行文件
+  - `configureVSCode` 改用 `codegraphPath`（`findCodeGraphCommand` 解析的绝对路径）作为 command 写入 mcp.json 与 `~/.copilot/mcp-config.json`，不依赖 PATH
+  - `AgentConfig.configure` 接口增加可选 `codegraphPath` 参数；`configureAgents` 把绝对路径传入各代理（其它代理仍用裸命令，仅 VS Code 使用绝对路径）
+- **变更文件**:
+  - `src/agentConfig.ts` - `configureVSCode` 使用绝对路径、`AgentConfig` 接口与 `configureAgents` 透传 `codegraphPath`
+  - `package.json` - 版本 0.9.28 -> 0.9.29
+
+---
+
+### 0.9.28 (2026-08-16)
+- 修复 Remote-SSH / Agent Host 环境下 VS Code MCP 自动配置不生效
+  - 根因：扩展在远程 Extension Host（vscode-server）运行时，`os.homedir()` 返回服务器路径，旧逻辑把配置写入 `~/.config/Code/User/mcp.json`（本机桌面版目录），而 VS Code Server 实际读取远程 userData；且 Agent Host 只读 `~/.copilot/mcp-config.json` 与 `.mcp.json`，不读 `.vscode/mcp.json`
+  - `getVSCodeConfigPath()` 优先解析远程 vscode-server userData（`~/.vscode-server/data/User/mcp.json`，即 `MCP: Open Remote User Configuration` 的文件），保留本机桌面版兜底
+  - 新增 `getVSCodeAgentHostConfigPath()`（`~/.copilot/mcp-config.json`），`configureVSCode()` 同时写入 Agent Host 用户级配置（`~/.copilot` 目录存在时）
+  - `isVSCodeInstalled()` 增加 `~/.vscode-server/data/User` 与 `~/.copilot` 检测
+  - 配置后需重启 VS Code 或重载窗口生效
+- **变更文件**:
+  - `src/agentConfig.ts` - 重构 `getVSCodeConfigPath`/`configureVSCode`/`isVSCodeInstalled`，新增 `getVSCodeAgentHostConfigPath`
+  - `src/i18n.ts` - `agentConfig.success` 文案补充"重载窗口"
+  - `package.json` - 版本 0.9.27 -> 0.9.28
+
+---
+
+### 0.9.27 (2026-08-16)
+- 新增 VS Code 原生 MCP 自动配置支持（用户级，对所有项目生效）
+  - 配置路径（自动解析两种发行形态）:
+    - 稳定版: 平台相关 `Code/User/mcp.json`（Linux: `~/.config/Code/User/mcp.json`；macOS: `~/Library/Application Support/Code/User/mcp.json`；Windows: `%APPDATA%\Code\User\mcp.json`）
+    - Insiders: 平台相关 `Code - Insiders/User/mcp.json`
+  - 使用 VS Code 1.99+ 原生的 `servers` 顶层键（区别于 Cursor/Claude 的 `mcpServers`），复用 `MCP_SERVER_CONFIG`
+  - 安装检测: 各平台 userData 目录（`Code` 或 `Code - Insiders`）任一存在
+  - 配置后重启 VS Code 即可在 Copilot Chat 中使用 codegraph 工具
+- **支持的代理 (13个)**: VS Code、Claude Code、Cursor、Codex CLI、opencode、Hermes Agent、Gemini CLI、Antigravity IDE、Kiro、Qoder、Kilo Code、Trae IDE、Trae CN IDE
+- **变更文件**:
+  - `src/agentConfig.ts` - 新增 `getVSCodeConfigPath`/`configureVSCode`/`isVSCodeInstalled` 并注册
+  - `src/i18n.ts` - `agentConfig.noAgents`/`agentConfig.configuring` 文案补充 VS Code
+  - `package.json` - 版本 0.9.26 -> 0.9.27
+
+---
+
 ### 0.9.26 (2026-08-02)
 - 变更记录与代码注释文案精简
   - 去除地区性/非正式表述，适配扩展商店审核要求

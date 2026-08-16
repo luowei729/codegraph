@@ -4,6 +4,7 @@
  * 直接写入 MCP 配置到各 AI 代理的配置文件，不依赖 CLI 命令。
  *
  * 支持的代理及其配置格式：
+ * - VS Code: JSON 格式 (用户级: 平台相关 Code/User/mcp.json；Insiders: Code - Insiders)
  * - Claude Code: JSON 格式 (~/.claude.json + ~/.claude/settings.json 权限)
  * - Cursor: JSON 格式 (~/.cursor/mcp.json)
  * - Codex CLI: TOML 格式 (~/.codex/config.toml)
@@ -81,8 +82,8 @@ interface AgentConfig {
   name: string;
   /** 检测函数：检查代理是否已安装 */
   isInstalled: () => boolean;
-  /** 配置函数：写入 MCP 配置 */
-  configure: () => { action: 'created' | 'updated' | 'unchanged'; success: boolean; error?: string };
+  /** 配置函数：写入 MCP 配置。codegraphPath 为 codegraph CLI 的绝对路径（可能为空） */
+  configure: (codegraphPath?: string) => { action: 'created' | 'updated' | 'unchanged'; success: boolean; error?: string };
 }
 
 /**
@@ -112,16 +113,121 @@ function deepEqual(a: unknown, b: unknown): boolean {
 
 /**
  * 读取 JSON 配置文件
+ *
+ * Fix#14: 解析失败返回 null 而非空对象。旧逻辑返回 {} 会让调用方误以为
+ * "无配置"，随后 writeJsonConfig 整体覆盖写入——文件损坏（半写状态、
+ * 手误编辑、非法编码）时会把用户配置永久替换成"只有 codegraph"，数据
+ * 丢失。调用方收到 null 必须放弃写入。文件不存在或空白则返回 {}（新建
+ * 场景安全）。
  */
-function readJsonConfig(filePath: string): Record<string, any> {
-  if (!fs.existsSync(filePath)) {
-    return {};
-  }
+function readJsonConfig(filePath: string): Record<string, any> | null {
+  if (!fs.existsSync(filePath)) return {};
+  const raw = fs.readFileSync(filePath, 'utf-8');
+  if (!raw.trim()) return {};
   try {
-    return JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+    return JSON.parse(raw);
   } catch (err) {
     console.warn(`[CodeGraph] 无法解析配置文件 ${filePath}:`, err);
-    return {};
+    return null;
+  }
+}
+
+/**
+ * 读取失败时的统一错误返回（数据保护：绝不覆盖损坏/不可解析的配置文件）。
+ * 各 configure* 函数在 readJsonConfig/readJsoncConfig 返回 null 时使用。
+ */
+function configReadError(filePath: string): { action: 'created' | 'updated' | 'unchanged'; success: boolean; error?: string } {
+  return {
+    action: 'unchanged',
+    success: false,
+    error: `无法解析 ${filePath}（JSON/JSONC 语法错误）。已跳过写入以保护现有配置。`,
+  };
+}
+
+/**
+ * 剥离 JSONC（含注释/尾逗号的 JSON）中的注释与尾逗号，得到严格 JSON。
+ *
+ * 为什么需要？opencode 等代理的配置文件是 JSONC 格式（允许 // 行注释、
+ * /* 块注释 *​/ 和尾逗号）。JSON.parse 遇到这些会抛错，导致旧逻辑读到空对象后
+ * 用 JSON.stringify 整体覆盖写入，清空用户全部配置（数据丢失 bug）。
+ *
+ * 实现采用单遍状态机：只在字符串外处理注释/尾逗号，字符串内的字符原样保留，
+ * 不会误伤 "a//b"、"a,}" 之类的字符串字面量。零依赖（.vsix 打包不含
+ * node_modules，不能运行时 require jsonc-parser）。
+ */
+function stripJsonc(jsonc: string): string {
+  let out = '';
+  let i = 0;
+  let inString = false;
+  while (i < jsonc.length) {
+    const ch = jsonc[i];
+    if (inString) {
+      // 字符串内：原样输出，处理转义符，直到闭合引号
+      out += ch;
+      if (ch === '\\' && i + 1 < jsonc.length) {
+        out += jsonc[i + 1];
+        i += 2;
+        continue;
+      }
+      if (ch === '"') inString = false;
+      i++;
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+      out += ch;
+      i++;
+      continue;
+    }
+    if (ch === '/' && jsonc[i + 1] === '/') {
+      // 行注释：跳过到行尾（保留换行，维持行号对齐）
+      while (i < jsonc.length && jsonc[i] !== '\n') i++;
+      continue;
+    }
+    if (ch === '/' && jsonc[i + 1] === '*') {
+      // 块注释：跳过到 */ 之后
+      i += 2;
+      while (i < jsonc.length && !(jsonc[i] === '*' && jsonc[i + 1] === '/')) i++;
+      i = Math.min(i + 2, jsonc.length);
+      continue;
+    }
+    if (ch === ',') {
+      // 尾逗号检测：跳过空白后遇到 } 或 ] 则丢弃该逗号，否则原样输出
+      let j = i + 1;
+      while (j < jsonc.length && /\s/.test(jsonc[j])) j++;
+      if (jsonc[j] === '}' || jsonc[j] === ']') {
+        i++;
+        continue;
+      }
+      out += ch;
+      i++;
+      continue;
+    }
+    out += ch;
+    i++;
+  }
+  return out;
+}
+
+/**
+ * 读取 JSONC 配置文件（opencode 等允许注释/尾逗号的 JSON 变体）。
+ *
+ * 解析策略：优先尝试严格 JSON.parse（无注释时最直接）；失败时剥离
+ * 注释/尾逗号后再解析。两者都失败返回 null —— 调用方收到 null 必须
+ * 放弃写入，绝不覆盖原文件，避免清空用户配置。
+ */
+function readJsoncConfig(filePath: string): Record<string, any> | null {
+  if (!fs.existsSync(filePath)) return {};
+  const raw = fs.readFileSync(filePath, 'utf-8');
+  try {
+    return JSON.parse(raw);
+  } catch {
+    try {
+      return JSON.parse(stripJsonc(raw));
+    } catch (err) {
+      console.warn(`[CodeGraph] 无法解析 JSONC 配置文件 ${filePath}:`, err);
+      return null;
+    }
   }
 }
 
@@ -248,6 +354,11 @@ function upsertTomlTable(content: string, header: string, tableBlock: string): {
 
 /**
  * 配置 Claude Code
+ *
+ * Fix#10: 权限列表（permissions.allow）补齐与 MCP 服务器配置解耦——
+ * 旧逻辑只在 mcpServers 变更时补权限，导致"已配置 MCP 但缺权限"的存量用户
+ * 永远补不上。现在两步各自独立幂等：MCP 配置有差异则更新，权限缺哪条补哪条，
+ * action 取两者中更重的状态。
  */
 function configureClaudeCode(): { action: 'created' | 'updated' | 'unchanged'; success: boolean; error?: string } {
   try {
@@ -255,40 +366,47 @@ function configureClaudeCode(): { action: 'created' | 'updated' | 'unchanged'; s
     const mcpPath = path.join(homeDir, '.claude.json');
     const settingsPath = path.join(homeDir, '.claude', 'settings.json');
     
-    // 1. 写入 MCP 服务器配置
+    // 1. 写入 MCP 服务器配置（幂等：无差异则不动）
+    // Fix#14: 解析失败（文件损坏）返回 null 时放弃写入，保护用户配置
     const mcpConfig = readJsonConfig(mcpPath);
+    if (mcpConfig === null) return configReadError(mcpPath);
     const existingMcp = mcpConfig.mcpServers?.codegraph;
-    
-    if (!deepEqual(existingMcp, MCP_SERVER_CONFIG)) {
+    const mcpChanged = !deepEqual(existingMcp, MCP_SERVER_CONFIG);
+
+    if (mcpChanged) {
       if (!mcpConfig.mcpServers) mcpConfig.mcpServers = {};
       mcpConfig.mcpServers.codegraph = MCP_SERVER_CONFIG;
       writeJsonConfig(mcpPath, mcpConfig);
-      
-      const mcpAction = existingMcp ? 'updated' : 'created';
-      
-      // 2. 写入权限配置
-      const settings = readJsonConfig(settingsPath);
-      if (!settings.permissions) settings.permissions = {};
-      if (!Array.isArray(settings.permissions.allow)) settings.permissions.allow = [];
-      
-      const beforePermissions = [...settings.permissions.allow];
-      for (const perm of CODEGRAPH_PERMISSIONS) {
-        if (!settings.permissions.allow.includes(perm)) {
-          settings.permissions.allow.push(perm);
-        }
-      }
-      
-      if (!deepEqual(beforePermissions, settings.permissions.allow)) {
-        writeJsonConfig(settingsPath, settings);
-      }
-      
-      return { action: mcpAction, success: true };
     }
-    
-    return { action: 'unchanged', success: true };
+
+    // 2. 无条件补齐权限列表（幂等：缺哪条补哪条，全在则跳过）
+    // Fix#14: settings.json 损坏时跳过权限写入（MCP 配置已写入，可接受部分成功）
+    const settings = readJsonConfig(settingsPath);
+    if (settings === null) return configReadError(settingsPath);
+    if (!settings.permissions) settings.permissions = {};
+    if (!Array.isArray(settings.permissions.allow)) settings.permissions.allow = [];
+
+    const beforePermissions = [...settings.permissions.allow];
+    for (const perm of CODEGRAPH_PERMISSIONS) {
+      if (!settings.permissions.allow.includes(perm)) {
+        settings.permissions.allow.push(perm);
+      }
+    }
+
+    const permsChanged = !deepEqual(beforePermissions, settings.permissions.allow);
+    if (permsChanged) {
+      writeJsonConfig(settingsPath, settings);
+    }
+
+    // 3. action 综合两步结果：优先 MCP 的 created/updated，否则看权限是否变更
+    let action: 'created' | 'updated' | 'unchanged' = 'unchanged';
+    if (mcpChanged) action = existingMcp ? 'updated' : 'created';
+    else if (permsChanged) action = 'updated';
+
+    return { action, success: true };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    return { action: 'created', success: false, error: msg };
+    return { action: 'unchanged', success: false, error: msg };
   }
 }
 
@@ -300,7 +418,9 @@ function configureCursor(): { action: 'created' | 'updated' | 'unchanged'; succe
     const homeDir = os.homedir();
     const mcpPath = path.join(homeDir, '.cursor', 'mcp.json');
     
+    // Fix#14: 解析失败（文件损坏）时放弃写入
     const config = readJsonConfig(mcpPath);
+    if (config === null) return configReadError(mcpPath);
     const existing = config.mcpServers?.codegraph;
     
     if (!deepEqual(existing, MCP_SERVER_CONFIG)) {
@@ -314,7 +434,7 @@ function configureCursor(): { action: 'created' | 'updated' | 'unchanged'; succe
     return { action: 'unchanged', success: true };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    return { action: 'created', success: false, error: msg };
+    return { action: 'unchanged', success: false, error: msg };
   }
 }
 
@@ -348,7 +468,7 @@ function configureCodex(): { action: 'created' | 'updated' | 'unchanged'; succes
     return { action, success: true };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    return { action: 'created', success: false, error: msg };
+    return { action: 'unchanged', success: false, error: msg };
   }
 }
 
@@ -369,8 +489,17 @@ function configureOpencode(): { action: 'created' | 'updated' | 'unchanged'; suc
     if (!fs.existsSync(configDir)) {
       fs.mkdirSync(configDir, { recursive: true });
     }
-    
-    const config = readJsonConfig(configPath);
+
+    // 使用 JSONC 专用读取：opencode 配置允许注释/尾逗号，严格 JSON.parse 会失败。
+    // 解析失败返回 null 时必须放弃写入（否则整体覆盖会清空用户配置）。
+    const config = readJsoncConfig(configPath);
+    if (config === null) {
+      return {
+        action: 'unchanged',
+        success: false,
+        error: `无法解析 ${configPath}（JSONC 语法错误）。已跳过写入以保护现有配置。`,
+      };
+    }
     const existing = config.mcp?.codegraph;
     
     if (!deepEqual(existing, OPENCODE_MCP_CONFIG)) {
@@ -390,14 +519,19 @@ function configureOpencode(): { action: 'created' | 'updated' | 'unchanged'; suc
     return { action: 'unchanged', success: true };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    return { action: 'created', success: false, error: msg };
+    return { action: 'unchanged', success: false, error: msg };
   }
 }
 
 /**
  * 配置 Hermes Agent（YAML 格式）
+ *
+ * Fix#12: command 优先使用 codegraphPath（绝对路径）。与 VS Code 同理——
+ * 扩展宿主的 PATH 可能不含 ~/.local/bin，裸命令 `codegraph` 会让 Hermes
+ * spawn ENOENT。绝对路径含特殊字符（空格/反斜杠等）时用 JSON.stringify
+ * 生成带引号的 YAML 双引号字符串（YAML 双引号转义规则与 JSON 一致）。
  */
-function configureHermes(): { action: 'created' | 'updated' | 'unchanged'; success: boolean; error?: string } {
+function configureHermes(codegraphPath?: string): { action: 'created' | 'updated' | 'unchanged'; success: boolean; error?: string } {
   try {
     const homeDir = os.homedir();
     const hermesHome = process.env.HERMES_HOME || path.join(homeDir, '.hermes');
@@ -409,12 +543,16 @@ function configureHermes(): { action: 'created' | 'updated' | 'unchanged'; succe
     
     const existing = fs.existsSync(configPath) ? fs.readFileSync(configPath, 'utf-8') : '';
 
+    // command 值：绝对路径时用 JSON.stringify 生成 YAML 双引号字符串（防空格/反斜杠问题）；
+    // 未提供路径时保持裸命令 codegraph（与旧行为一致，保证幂等）。
+    const commandValue = codegraphPath ? JSON.stringify(codegraphPath) : 'codegraph';
+
     // codegraph 子块（2 空格缩进，挂在 mcp_servers: 下）。
     // Fix#7: 不再无条件追加完整 mcp_servers 块，改为真正的 upsert：
     // 已有 codegraph 块则就地替换，避免非标准 command（如绝对路径）时产生重复 mcp_servers 块。
     const codegraphLines = [
       '  codegraph:',
-      '    command: codegraph',
+      `    command: ${commandValue}`,
       '    args:',
       '      - serve',
       '      - --mcp',
@@ -486,7 +624,7 @@ function configureHermes(): { action: 'created' | 'updated' | 'unchanged'; succe
     return { action: 'created', success: true };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    return { action: 'created', success: false, error: msg };
+    return { action: 'unchanged', success: false, error: msg };
   }
 }
 
@@ -499,7 +637,9 @@ function configureGemini(): { action: 'created' | 'updated' | 'unchanged'; succe
     const configDir = path.join(homeDir, '.gemini');
     const settingsPath = path.join(configDir, 'settings.json');
     
+    // Fix#14: 解析失败（文件损坏）时放弃写入
     const config = readJsonConfig(settingsPath);
+    if (config === null) return configReadError(settingsPath);
     const existing = config.mcpServers?.codegraph;
     
     if (!deepEqual(existing, MCP_SERVER_CONFIG)) {
@@ -513,7 +653,7 @@ function configureGemini(): { action: 'created' | 'updated' | 'unchanged'; succe
     return { action: 'unchanged', success: true };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    return { action: 'created', success: false, error: msg };
+    return { action: 'unchanged', success: false, error: msg };
   }
 }
 
@@ -526,7 +666,9 @@ function configureAntigravity(): { action: 'created' | 'updated' | 'unchanged'; 
     const configDir = path.join(homeDir, '.gemini', 'antigravity');
     const mcpPath = path.join(configDir, 'mcp_config.json');
     
+    // Fix#14: 解析失败（文件损坏）时放弃写入
     const config = readJsonConfig(mcpPath);
+    if (config === null) return configReadError(mcpPath);
     const existing = config.mcpServers?.codegraph;
     
     if (!deepEqual(existing, MCP_SERVER_CONFIG)) {
@@ -540,7 +682,7 @@ function configureAntigravity(): { action: 'created' | 'updated' | 'unchanged'; 
     return { action: 'unchanged', success: true };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    return { action: 'created', success: false, error: msg };
+    return { action: 'unchanged', success: false, error: msg };
   }
 }
 
@@ -553,7 +695,9 @@ function configureKiro(): { action: 'created' | 'updated' | 'unchanged'; success
     const configDir = path.join(homeDir, '.kiro');
     const configPath = path.join(configDir, 'config.json');
     
+    // Fix#14: 解析失败（文件损坏）时放弃写入
     const config = readJsonConfig(configPath);
+    if (config === null) return configReadError(configPath);
     const existing = config.mcpServers?.codegraph;
     
     if (!deepEqual(existing, MCP_SERVER_CONFIG)) {
@@ -567,7 +711,7 @@ function configureKiro(): { action: 'created' | 'updated' | 'unchanged'; success
     return { action: 'unchanged', success: true };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    return { action: 'created', success: false, error: msg };
+    return { action: 'unchanged', success: false, error: msg };
   }
 }
 
@@ -579,7 +723,9 @@ function configureQoder(): { action: 'created' | 'updated' | 'unchanged'; succes
     const homeDir = os.homedir();
     const mcpPath = path.join(homeDir, '.config', 'QoderCN', 'SharedClientCache', 'mcp.json');
     
+    // Fix#14: 解析失败（文件损坏）时放弃写入
     const config = readJsonConfig(mcpPath);
+    if (config === null) return configReadError(mcpPath);
     const existing = config.mcpServers?.codegraph;
     
     if (!deepEqual(existing, MCP_SERVER_CONFIG)) {
@@ -593,7 +739,7 @@ function configureQoder(): { action: 'created' | 'updated' | 'unchanged'; succes
     return { action: 'unchanged', success: true };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    return { action: 'created', success: false, error: msg };
+    return { action: 'unchanged', success: false, error: msg };
   }
 }
 
@@ -609,7 +755,11 @@ function configureKiloCode(): { action: 'created' | 'updated' | 'unchanged'; suc
     const homeDir = os.homedir();
     const configPath = path.join(homeDir, '.config', 'kilo', 'kilo.jsonc');
     
-    const config = readJsonConfig(configPath);
+    // Fix#13: kilo.jsonc 是 JSONC 格式（允许注释/尾逗号），必须用 readJsoncConfig。
+    // 旧逻辑用 readJsonConfig（JSON.parse）读失败返回 {}，writeJsonConfig 整体
+    // 覆盖写入会清空用户 Kilo Code 全部配置（与 opencode 的数据丢失 bug 同模式）。
+    const config = readJsoncConfig(configPath);
+    if (config === null) return configReadError(configPath);
     
     // Kilo Code 使用 `mcp` 键，command 是数组格式
     const kiloMcpConfig = {
@@ -632,7 +782,7 @@ function configureKiloCode(): { action: 'created' | 'updated' | 'unchanged'; suc
     return { action: 'unchanged', success: true };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    return { action: 'created', success: false, error: msg };
+    return { action: 'unchanged', success: false, error: msg };
   }
 }
 
@@ -687,7 +837,9 @@ function getTraeConfigPath(): string {
 function configureTrae(): { action: 'created' | 'updated' | 'unchanged'; success: boolean; error?: string } {
   try {
     const mcpPath = getTraeConfigPath();
+    // Fix#14: 解析失败（文件损坏）时放弃写入
     const config = readJsonConfig(mcpPath);
+    if (config === null) return configReadError(mcpPath);
     const existing = config.mcpServers?.codegraph;
 
     // 与其他 JSON 代理共用 MCP_SERVER_CONFIG，deepEqual 保证重复运行不产生重复配置
@@ -702,7 +854,7 @@ function configureTrae(): { action: 'created' | 'updated' | 'unchanged'; success
     return { action: 'unchanged', success: true };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    return { action: 'created', success: false, error: msg };
+    return { action: 'unchanged', success: false, error: msg };
   }
 }
 
@@ -757,7 +909,9 @@ function getTraeCnConfigPath(): string {
 function configureTraeCn(): { action: 'created' | 'updated' | 'unchanged'; success: boolean; error?: string } {
   try {
     const mcpPath = getTraeCnConfigPath();
+    // Fix#14: 解析失败（文件损坏）时放弃写入
     const config = readJsonConfig(mcpPath);
+    if (config === null) return configReadError(mcpPath);
     const existing = config.mcpServers?.codegraph;
 
     // 与其他 JSON 代理共用 MCP_SERVER_CONFIG，deepEqual 保证重复运行不产生重复配置
@@ -772,7 +926,148 @@ function configureTraeCn(): { action: 'created' | 'updated' | 'unchanged'; succe
     return { action: 'unchanged', success: true };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    return { action: 'created', success: false, error: msg };
+    return { action: 'unchanged', success: false, error: msg };
+  }
+}
+
+/**
+ * 解析 VS Code 用户级 MCP 配置文件路径
+ *
+ * VS Code 1.99+ 原生支持 MCP，用户级（User scope）配置位于
+ * {userData}/mcp.json，随 VS Code 的 userData 目录约定（与 Trae 桌面版一致）：
+ * - Windows: %APPDATA%\Code\User\mcp.json（Insiders: Code - Insiders）
+ * - macOS:   ~/Library/Application Support/Code/User/mcp.json
+ * - Linux:   ~/.config/Code/User/mcp.json
+ *
+ * 支持两种运行形态：
+ * 1. 远程（Remote-SSH / Dev Containers 等）：扩展跑在 vscode-server 中，
+ *    userData 位于 ~/.vscode-server/data/User，用户级 mcp.json 即
+ *    `MCP: Open Remote User Configuration` 打开的文件。codegraph CLI 在
+ *    服务器上，MCP 服务器必须跑在远程，因此远程形态必须优先。
+ * 2. 本机桌面版：稳定版 Code / Insiders "Code - Insiders"（按平台展开）。
+ *
+ * 解析顺序：优先返回已存在的 mcp.json；其次返回父目录已存在的候选
+ * （确保写入用户实际使用的形态）；都不存在时返回远程路径（若 vscode-server
+ * 存在）否则稳定版路径（writeJsonConfig 会递归创建目录）。
+ */
+function getVSCodeConfigPath(): string {
+  const homeDir = os.homedir();
+  const vscodeServerUserData = path.join(homeDir, '.vscode-server', 'data', 'User');
+
+  // 0) 远程形态（Remote-SSH / Dev Containers）：vscode-server userData 存在即
+  //    视为远程环境。codegraph CLI 与扩展同机，MCP 服务器必须跑在远程，
+  //    用户级 mcp.json 即 ~/.vscode-server/data/User/mcp.json
+  //    （MCP: Open Remote User Configuration 打开的文件）。无条件优先返回，
+  //    避免服务器上残留的桌面版 mcp.json（本机目录约定）劫持解析。
+  if (fs.existsSync(vscodeServerUserData)) {
+    return path.join(vscodeServerUserData, 'mcp.json');
+  }
+
+  // 1) 本机桌面版形态：稳定版优先，Insiders 其次（按平台展开 userData 目录）
+  const candidates: string[] = [];
+  const appDirs: string[] = ['Code', 'Code - Insiders'];
+  for (const app of appDirs) {
+    if (process.platform === 'win32') {
+      candidates.push(path.join(process.env.APPDATA || path.join(homeDir, 'AppData', 'Roaming'), app, 'User', 'mcp.json'));
+    } else if (process.platform === 'darwin') {
+      candidates.push(path.join(homeDir, 'Library', 'Application Support', app, 'User', 'mcp.json'));
+    } else {
+      candidates.push(path.join(homeDir, '.config', app, 'User', 'mcp.json'));
+    }
+  }
+
+  // 1) 优先使用已存在的 mcp.json，避免写错位置
+  for (const c of candidates) {
+    if (fs.existsSync(c)) return c;
+  }
+  // 2) 其次使用父目录已存在的候选（User 目录已存在），确保写入用户实际使用的形态
+  for (const c of candidates) {
+    if (fs.existsSync(path.dirname(c))) return c;
+  }
+  // 3) 兜底：返回稳定版路径（writeJsonConfig 会递归创建目录）
+  return candidates[0];
+}
+
+/**
+ * 解析 VS Code Agent Host 用户级 MCP 配置文件路径
+ *
+ * Agent Host 是 VS Code 新的独立代理运行时（chat.agentHost.enabled），它
+ * 不读 .vscode/mcp.json，只读 harness-agnostic 的配置文件：
+ * - 用户级: ~/.copilot/mcp-config.json
+ * - 工作区: .mcp.json
+ *
+ * 格式与 mcp.json 一致（顶层 `servers` 键），因此复用 MCP_SERVER_CONFIG。
+ * 远程形态下 Agent Host 跑在服务器上，~/.copilot 目录亦位于服务器
+ * （本机则是用户电脑）。
+ */
+function getVSCodeAgentHostConfigPath(): string {
+  return path.join(os.homedir(), '.copilot', 'mcp-config.json');
+}
+
+/**
+ * 配置 VS Code（JSON 格式）
+ *
+ * VS Code 1.99+ 原生 MCP 配置使用顶层 `servers` 键（区别于 Cursor/Claude 的
+ * `mcpServers`），其中每个服务器使用 `type/command/args` 描述，与
+ * MCP_SERVER_CONFIG 完全同构，因此直接复用该模板。
+ *
+ * command 使用 codegraphPath（绝对路径）而非裸 `codegraph`：
+ * Remote-SSH / Agent Host 下 VS Code Server 进程的 PATH 不含 ~/.local/bin
+ * （shell 配置只在交互/登录 shell 生效），裸命令会导致 spawn ENOENT。
+ *
+ * 写入两个位置（均用户级、幂等）：
+ * 1. 主 mcp.json（getVSCodeConfigPath() 解析，远程 vscode-server userData
+ *    或本机桌面版 userData）——供 VS Code 的 MCP 管理（MCP: List Servers /
+ *    chat 工具发现）识别，VS Code 会自动转发给 Agent Host。
+ * 2. ~/.copilot/mcp-config.json（Agent Host 用户级，目录存在时）——
+ *    Agent Host 原生读取，不依赖 VS Code 转发。
+ *
+ * 配置后需重启 VS Code（或重载窗口）以让 Copilot Chat 发现该 MCP 服务器。
+ */
+function configureVSCode(codegraphPath?: string): { action: 'created' | 'updated' | 'unchanged'; success: boolean; error?: string } {
+  try {
+    // 绝对路径优先（修复 VS Code Server PATH 缺 ~/.local/bin 导致的 ENOENT），
+    // 未提供时回退到裸命令 `codegraph`
+    const serverConfig = codegraphPath
+      ? { ...MCP_SERVER_CONFIG, command: codegraphPath }
+      : MCP_SERVER_CONFIG;
+
+    // 1) 主 mcp.json：VS Code 原生 MCP 配置
+    const mcpPath = getVSCodeConfigPath();
+    // Fix#14: 解析失败（文件损坏）时放弃写入
+    const config = readJsonConfig(mcpPath);
+    if (config === null) return configReadError(mcpPath);
+    const existing = config.servers?.codegraph;
+
+    // VS Code 用 `servers` 顶层键；值结构与 serverConfig 一致，deepEqual 保证幂等
+    let action: 'created' | 'updated' | 'unchanged' = 'unchanged';
+    if (!deepEqual(existing, serverConfig)) {
+      if (!config.servers) config.servers = {};
+      config.servers.codegraph = serverConfig;
+      writeJsonConfig(mcpPath, config);
+      action = existing ? 'updated' : 'created';
+    }
+
+    // 2) Agent Host 用户级 mcp-config.json（~/.copilot 目录存在时写入；
+    //    Agent Host 原生读取，不依赖 VS Code 转发）
+    const copilotDir = path.join(os.homedir(), '.copilot');
+    if (fs.existsSync(copilotDir)) {
+      const ahPath = getVSCodeAgentHostConfigPath();
+      const ahConfig = readJsonConfig(ahPath);
+      if (ahConfig === null) return configReadError(ahPath);
+      const ahExisting = ahConfig.servers?.codegraph;
+      if (!deepEqual(ahExisting, serverConfig)) {
+        if (!ahConfig.servers) ahConfig.servers = {};
+        ahConfig.servers.codegraph = serverConfig;
+        writeJsonConfig(ahPath, ahConfig);
+        if (action === 'unchanged') action = ahExisting ? 'updated' : 'created';
+      }
+    }
+
+    return { action, success: true };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return { action: 'unchanged', success: false, error: msg };
   }
 }
 
@@ -871,6 +1166,30 @@ function isTraeCnInstalled(): boolean {
   return markers.some(p => fs.existsSync(p));
 }
 
+function isVSCodeInstalled(): boolean {
+  const homeDir = os.homedir();
+  // VS Code 标记目录：
+  // 1. 远程形态（Remote-SSH / Dev Containers）：vscode-server 的 userData 目录
+  //    ~/.vscode-server/data/User —— 扩展运行于此形态时标准桌面版目录可能不存在
+  // 2. Agent Host：~/.copilot（harness-agnostic 用户级配置目录）
+  // 3. 本机桌面版：用户级 userData 目录（稳定版 Code 或 Insiders "Code - Insiders"）
+  const markers: string[] = [
+    path.join(homeDir, '.vscode-server', 'data', 'User'),
+    path.join(homeDir, '.copilot'),
+  ];
+  for (const app of ['Code', 'Code - Insiders']) {
+    if (process.platform === 'win32') {
+      markers.push(path.join(process.env.APPDATA || path.join(homeDir, 'AppData', 'Roaming'), app));
+    } else if (process.platform === 'darwin') {
+      markers.push(path.join(homeDir, 'Library', 'Application Support', app));
+    } else {
+      markers.push(path.join(homeDir, '.config', app));
+    }
+  }
+  // 任一标记目录存在即视为已安装
+  return markers.some(p => fs.existsSync(p));
+}
+
 /**
  * 获取所有支持的代理配置
  */
@@ -936,6 +1255,11 @@ function getAgentConfigs(): AgentConfig[] {
       isInstalled: isTraeCnInstalled,
       configure: configureTraeCn,
     },
+    {
+      name: 'VS Code',
+      isInstalled: isVSCodeInstalled,
+      configure: configureVSCode,
+    },
   ];
 }
 
@@ -945,13 +1269,15 @@ function getAgentConfigs(): AgentConfig[] {
  * 在扩展激活时作为后台任务调用。
  * 幂等 — 如果所有代理都已配置，立即返回。
  *
- * @param _codegraphPath - 保留参数（兼容性），不再使用
+ * @param codegraphPath - codegraph CLI 的绝对路径（findCodeGraphCommand 的结果），
+ *   传给 VS Code 等代理作为 MCP command，避免 VS Code Server PATH 不含
+ *    ~/.local/bin 时 spawn ENOENT
  * @param _env - 保留参数（兼容性），不再使用
  * @param silent - 是否静默（不显示通知）
  * @returns AgentConfigResult 包含成功状态和摘要
  */
 export async function configureAgents(
-  _codegraphPath: string,
+  codegraphPath: string,
   _env: NodeJS.ProcessEnv,
   silent: boolean = false
 ): Promise<AgentConfigResult> {
@@ -971,7 +1297,9 @@ export async function configureAgents(
       continue;
     }
 
-    const result = agent.configure();
+    // 传入 codegraphPath（绝对路径）：VS Code 等代理用它作为 MCP command，
+    // 避免 VS Code Server PATH 不含 ~/.local/bin 时 spawn ENOENT
+    const result = agent.configure(codegraphPath);
     results.push({
       name: agent.name,
       action: result.action,

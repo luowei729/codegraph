@@ -447,12 +447,12 @@ const messages = {
     zh: 'CodeGraph 已配置到所有检测到的 AI 代理中。',
   },
   'agentConfig.configuring': {
-    en: 'Configuring CodeGraph for AI agents (Claude Code, Cursor, Codex, etc.)...',
-    zh: '正在为 AI 代理配置 CodeGraph（Claude Code、Cursor、Codex 等）...',
+    en: 'Configuring CodeGraph for AI agents (VS Code, Claude Code, Cursor, Codex, etc.)...',
+    zh: '正在为 AI 代理配置 CodeGraph（VS Code、Claude Code、Cursor、Codex 等）...',
   },
   'agentConfig.success': {
-    en: 'CodeGraph configured for all detected AI agents. Restart your agents to apply.',
-    zh: 'CodeGraph 已配置到所有检测到的 AI 代理。请重启代理以生效。',
+    en: 'CodeGraph configured for all detected AI agents. Restart or reload the window to apply.',
+    zh: 'CodeGraph 已配置到所有检测到的 AI 代理。请重启代理或重载窗口以生效。',
   },
   'agentConfig.partial': {
     en: 'CodeGraph configured for some AI agents. See Output panel for details.',
@@ -467,8 +467,8 @@ const messages = {
     zh: '为 AI 代理配置 CodeGraph',
   },
   'agentConfig.noAgents': {
-    en: 'No AI agents detected. Install Claude Code, Cursor, Codex, Trae, Trae CN, or Qoder to auto-configure.',
-    zh: '未检测到 AI 代理。安装 Claude Code、Cursor、Codex、Trae、Trae CN 或 Qoder 后将自动配置。',
+    en: 'No AI agents detected. Install VS Code, Claude Code, Cursor, Codex, Trae, Trae CN, or Qoder to auto-configure.',
+    zh: '未检测到 AI 代理。安装 VS Code、Claude Code、Cursor、Codex、Trae、Trae CN 或 Qoder 后将自动配置。',
   },
 } as const;
 

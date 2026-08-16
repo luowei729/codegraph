@@ -108,12 +108,15 @@ export class McpClient {
    * @param env - 子进程的环境变量（可选）。如果提供，将用于 spawn 子进程。
    *              这确保了 PATH 包含 ~/.local/bin 等常见安装目录，
    *              避免 "Executable not found in $PATH" 错误。
+   * @param clientVersion - 扩展版本号（可选）。MCP initialize 握手时上报，
+   *              服务端诊断/统计依赖真实版本。缺省时回退到固定值。
    */
   constructor(
     private command: string,
     private args: string[] = [],
     private cwd?: string,
-    private env?: NodeJS.ProcessEnv
+    private env?: NodeJS.ProcessEnv,
+    private clientVersion: string = '0.9.9'
   ) {}
 
   /**
@@ -235,10 +238,11 @@ export class McpClient {
       });
 
       // Step 1: Send 'initialize' request with our capabilities
+      // Fix#5: 客户端版本从构造函数注入（扩展实际版本），不再硬编码过期值。
       this.sendRequest('initialize', {
         protocolVersion: '2024-11-05',
         capabilities: {},
-        clientInfo: { name: 'codegraph-vscode', version: '0.9.9' },
+        clientInfo: { name: 'codegraph-vscode', version: this.clientVersion },
       })
         .then(() => {
           // Step 2: Send 'initialized' notification (Bug #2 fix)
@@ -314,13 +318,17 @@ export class McpClient {
     // The setTimeout callback for SIGKILL needs access to the process
     // even after this.process is set to null
     const proc = this.process;
-    if (proc && !proc.killed) {
+    if (proc && proc.exitCode === null && proc.signalCode === null) {
       proc.kill('SIGTERM');
       // Force kill after 5s if SIGTERM didn't work (orphan prevention)
       // Uses local 'proc' variable instead of 'this.process' which
       // will be null by the time this callback fires
+      // Fix#15: 存活判断改用 exitCode/signalCode。旧逻辑用 proc.killed——
+      // 它在 kill('SIGTERM') 被调用后立即变 true（表示"kill() 已调用"而非
+      // "进程已死"），导致子进程忽略 SIGTERM 时 `if (!proc.killed)` 恒 false，
+      // SIGKILL 兜底永不触发，留下孤儿进程。
       this.killTimeout = setTimeout(() => {
-        if (!proc.killed) {
+        if (proc.exitCode === null && proc.signalCode === null) {
           proc.kill('SIGKILL');
         }
       }, 5000);

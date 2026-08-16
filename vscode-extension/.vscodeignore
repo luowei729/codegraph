@@ -4,8 +4,8 @@
 src/**
 .vscode/**
 tsconfig.json
-node_modules/@types/**
-node_modules/typescript/**
+# 编译产物仅依赖 Node 内置模块与 vscode 运行时，node_modules 不需要进入包体
+node_modules/**
 
 # Include the compiled output
 !out/**

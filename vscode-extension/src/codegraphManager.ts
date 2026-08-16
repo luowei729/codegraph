@@ -422,6 +422,9 @@ export class CodeGraphManager implements vscode.Disposable {
    * - Downloads the correct platform-specific binary
    * - Works on macOS, Linux, and Windows
    *
+   * Fix#7: 增加 120s 超时。curl 网络挂起时进程会永久不退出，导致扩展
+   * 卡在「正在安装」状态。超时后 SIGKILL 子进程并按失败处理。
+   *
    * @returns true if installation succeeded
    */
   private async runStandaloneInstaller(): Promise<boolean> {
@@ -443,12 +446,20 @@ export class CodeGraphManager implements vscode.Disposable {
         ]);
       }
 
+      // Fix#7: 安装超时保护（120s），超时强制终止并按失败处理
+      const timeout = setTimeout(() => {
+        console.warn('[CodeGraph] Standalone installer timed out after 120s');
+        child.kill('SIGKILL');
+        resolve(false);
+      }, 120000);
+
       let stderr = '';
       child.stderr?.on('data', (data: Buffer) => {
         stderr += data.toString();
       });
 
       child.on('close', (code: number | null) => {
+        clearTimeout(timeout);
         if (code === 0) {
           resolve(true);
         } else {
@@ -458,6 +469,7 @@ export class CodeGraphManager implements vscode.Disposable {
       });
 
       child.on('error', (err: Error) => {
+        clearTimeout(timeout);
         console.warn('[CodeGraph] Standalone installer error:', err.message);
         resolve(false);
       });
@@ -485,6 +497,9 @@ export class CodeGraphManager implements vscode.Disposable {
   /**
    * Install CodeGraph via npm as a fallback.
    *
+   * Fix#7: 与 runStandaloneInstaller 相同，增加 120s 超时保护，
+   * 防止 npm 网络缓慢/挂起时扩展永久卡在「正在安装」。
+   *
    * @returns true if installation succeeded
    */
   private async runNpmInstaller(): Promise<boolean> {
@@ -494,12 +509,20 @@ export class CodeGraphManager implements vscode.Disposable {
         cwd: process.env.HOME || process.env.USERPROFILE || '.',
       });
 
+      // Fix#7: npm install 超时保护（120s）
+      const timeout = setTimeout(() => {
+        console.warn('[CodeGraph] npm install timed out after 120s');
+        child.kill('SIGKILL');
+        resolve(false);
+      }, 120000);
+
       let stderr = '';
       child.stderr?.on('data', (data: Buffer) => {
         stderr += data.toString();
       });
 
       child.on('close', (code: number | null) => {
+        clearTimeout(timeout);
         if (code === 0) {
           resolve(true);
         } else {
@@ -509,6 +532,7 @@ export class CodeGraphManager implements vscode.Disposable {
       });
 
       child.on('error', (err: Error) => {
+        clearTimeout(timeout);
         console.warn('[CodeGraph] npm install error:', err.message);
         resolve(false);
       });
@@ -517,6 +541,21 @@ export class CodeGraphManager implements vscode.Disposable {
 
   /**
    * Start the CodeGraph MCP server subprocess.
+   *
+   * 公开入口：每次调用都重置重试计数（Fix#2）。
+   * 为什么？旧逻辑 retryCount 只增不减，连续失败几次后用户点状态栏
+   * 「重试连接」会立即进入"已达最大重试"分支，手动重试永久失效。
+   * 现在任何手动触发（激活、初始化、状态栏重试、错误节点点击）都会
+   * 拿到完整的重试机会；只有 handleStartError 内部的自动重试递归
+   * 走 doStartCodeGraph（不重置），保证指数退避不被清零。
+   */
+  private async startCodeGraph(): Promise<void> {
+    this.retryCount = 0;
+    await this.doStartCodeGraph();
+  }
+
+  /**
+   * 实际启动逻辑（内部使用，自动重试递归调用不重置 retryCount）。
    *
    * Steps:
    * 1. Locate the codegraph executable
@@ -528,7 +567,7 @@ export class CodeGraphManager implements vscode.Disposable {
    * process exits transition the manager to 'error' state instead of leaving
    * it in a zombie 'ready' state.
    */
-  private async startCodeGraph(): Promise<void> {
+  private async doStartCodeGraph(): Promise<void> {
     const codegraphPath = this.findCodeGraphCommand();
     if (!codegraphPath) {
       // Should not reach here if autoInstallCodeGraph was called,
@@ -543,11 +582,14 @@ export class CodeGraphManager implements vscode.Disposable {
 
     // 使用 buildSpawnEnv() 确保子进程的 PATH 包含 ~/.local/bin 等常见安装目录，
     // 避免 "Executable not found in $PATH" 错误
+    // Fix#5: 第 5 个参数传入扩展真实版本号（package.json 由 VS Code 注入到
+    // context.extension.packageJSON），供 MCP initialize 握手上报，替代硬编码过期值。
     this.client = new McpClient(
       codegraphPath,
       ['serve', '--mcp'],
       this.projectPath,
-      this.buildSpawnEnv()
+      this.buildSpawnEnv(),
+      String(this.context.extension.packageJSON.version ?? '0.9.9')
     );
 
     // Bug #4 fix: Register crash callback so we transition to 'error' state
@@ -558,6 +600,12 @@ export class CodeGraphManager implements vscode.Disposable {
       const detail = code !== null ? `code ${code}` : `signal ${signal ?? 'null'}`;
       console.error(`[CodeGraph] MCP process crashed (${detail})`);
       this.setState('error');
+
+      // Fix#6: 崩溃后必须同步重置 codegraph:ready 上下文。命令面板中
+      // searchSymbol/showCallers 等 4 个命令的 when 条件依赖它，旧逻辑只
+      // 改 FSM 状态，导致崩溃后命令仍显示、点击才报"未就绪"。
+      void vscode.commands.executeCommand('setContext', 'codegraph:ready', false);
+
       vscode.window.showErrorMessage(
         t('connect.crashed', detail)
       );
@@ -595,18 +643,22 @@ export class CodeGraphManager implements vscode.Disposable {
    *
    * Retry delays: 2s, 4s, 8s (total ~14s before giving up).
    * This covers transient issues like daemon lock contention or slow disk I/O.
+   *
+   * Fix#2: 边界改为 `<= maxRetries`（旧逻辑 `<` 使第 3 次重试永远不触发，
+   * 与注释描述的 2s/4s/8s 不符）；递归重试调用 doStartCodeGraph 而非
+   * startCodeGraph，避免重置 retryCount 导致无限重试。
    */
   private async handleStartError(error: unknown): Promise<void> {
     this.retryCount++;
     const msg = error instanceof Error ? error.message : String(error);
 
-    if (this.retryCount < this.maxRetries) {
+    if (this.retryCount <= this.maxRetries) {
       const delayMs = Math.pow(2, this.retryCount) * 1000;
       vscode.window.showWarningMessage(
         t('connect.retryIn', msg, String(delayMs / 1000))
       );
       await new Promise((resolve) => setTimeout(resolve, delayMs));
-      await this.startCodeGraph();
+      await this.doStartCodeGraph();
     } else {
       this.setState('error');
       vscode.window.showErrorMessage(
@@ -691,11 +743,14 @@ export class CodeGraphManager implements vscode.Disposable {
     try {
       const whichCmd = process.platform === 'win32' ? 'where' : 'which';
       const spawnEnv = this.buildSpawnEnv();
+      // Fix#3: Windows 的 `where codegraph` 在 PATH 有多处匹配时输出多行，
+      // .trim() 后整段传给 fs.existsSync 恒为 false，误判"未安装"并触发
+      // 多余自动安装。取第一行（which 也同理，多行时只取第一个）。
       const globalBin = execSync(`${whichCmd} codegraph`, {
         encoding: 'utf8',
         timeout: 3000,
         env: spawnEnv,
-      }).trim();
+      }).split(/\r?\n/)[0].trim();
       if (globalBin && fs.existsSync(globalBin)) {
         return globalBin;
       }
@@ -762,6 +817,21 @@ export class CodeGraphManager implements vscode.Disposable {
    * 
    * 另外，使用 buildSpawnEnv() 确保子进程的 PATH 包含 ~/.local/bin 等常见安装目录，
    * 避免 "Executable not found in $PATH" 错误。
+   *
+   * Fix#16: 子进程 stdin 非交互（管道），codegraph init 索引完成后会调用
+   * offerWatchFallback -> clack.select("How should CodeGraph keep its index
+   * fresh?")。clack.select 在非 TTY stdin 下永久挂起等待按键（实测 8s+ 不
+   * 返回），导致 initialize() 卡死在「正在索引」。触发面：WSL2 /mnt/* 项目、
+   * CODEGRAPH_NO_WATCH=1 环境的 git 仓库。修复：spawn 后 3 秒向 stdin 注入
+   * 回车（\r）并关闭 stdin（end() 模拟 EOF）--回车让 clack.select 接受默认
+   * 推荐项（安装 git hooks），EOF 让流程走完后进程能正常退出（仅回车不关
+   * stdin 时进程仍挂：clack 的 keypress 监听保持事件循环活跃）。已实测：
+   * 注入后 init 3s 干净退出、git hooks 正确安装、outro Done 正常输出。
+   * 对 sync 等无交互的命令无副作用（多余的 \r 与 EOF 均被忽略，实测退出码 0）。
+   *
+   * Fix#17: 增加 120s 总超时。任何 CLI 子进程异常（clack 挂起、二进制损坏、
+   * 死锁）都让 Promise 永不 settle，UI 永久卡死。超时后 SIGKILL 子进程并
+   * reject，让上层走错误恢复路径。
    */
   private async runCliCommand(subcommand: string, args: string[] = []): Promise<void> {
     const codegraphPath = this.findCodeGraphCommand();
@@ -773,7 +843,36 @@ export class CodeGraphManager implements vscode.Disposable {
       const child = spawn(codegraphPath, [subcommand, ...args], {
         cwd: this.projectPath,
         env: this.buildSpawnEnv(),
+        // Fix#16: 显式 pipe stdin，供下方注入回车解除 clack.select 挂起
+        stdio: ['pipe', 'pipe', 'pipe'],
       });
+
+      let settled = false;
+      const settle = (fn: () => void): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(enterTimer);
+        clearTimeout(timeoutTimer);
+        fn();
+      };
+
+      // Fix#16: 3s 后注入回车并关闭 stdin（EOF），双重解除 clack 挂起（见上方注释）。
+      // 实测：仅 write('\r') 不够--init 流程走完后进程仍挂着不退出（clack 的
+      // keypress 监听保持事件循环活跃），必须 stdin.end() 模拟管道 EOF 才能让
+      // 进程正常退出。对 sync 等无交互命令无副作用（EOF 前已完成输出）。
+      const enterTimer = setTimeout(() => {
+        try {
+          child.stdin?.write('\r');
+          child.stdin?.end();
+        } catch { /* 进程可能已退出，忽略 */ }
+      }, 3000);
+
+      // Fix#17: 120s 总超时兜底，防止任何形式的子进程挂起永久卡死 UI
+      const timeoutTimer = setTimeout(() => {
+        console.warn(`[CodeGraph] codegraph ${subcommand} timed out after 120s`);
+        try { child.kill('SIGKILL'); } catch { /* ignore */ }
+        settle(() => reject(new Error(`codegraph ${subcommand} timed out after 120s`)));
+      }, 120000);
 
       let stdout = '';
       let stderr = '';
@@ -796,14 +895,14 @@ export class CodeGraphManager implements vscode.Disposable {
 
       child.on('close', (code: number | null) => {
         if (code === 0) {
-          resolve();
+          settle(() => resolve());
         } else {
-          reject(new Error(stderr || `Process exited with code ${code}`));
+          settle(() => reject(new Error(stderr || `Process exited with code ${code}`)));
         }
       });
 
       child.on('error', (err: Error) => {
-        reject(new Error(`Failed to run codegraph ${subcommand}: ${err.message}`));
+        settle(() => reject(new Error(`Failed to run codegraph ${subcommand}: ${err.message}`)));
       });
     });
   }
