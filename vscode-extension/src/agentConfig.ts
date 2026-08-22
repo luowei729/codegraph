@@ -1074,8 +1074,7 @@ function configureVSCode(codegraphPath?: string): { action: 'created' | 'updated
 /**
  * 检测代理是否已安装
  */
-function isClaudeCodeInstalled(): boolean {
-  const homeDir = os.homedir();
+function isClaudeCodeInstalled(): boolean {  const homeDir = os.homedir();
   return fs.existsSync(path.join(homeDir, '.claude')) || 
          fs.existsSync(path.join(homeDir, '.claude.json'));
 }
@@ -1164,6 +1163,54 @@ function isTraeCnInstalled(): boolean {
   }
   // 任一标记目录存在即视为已安装
   return markers.some(p => fs.existsSync(p));
+}
+
+/**
+ * 确保 VS Code 原生 MCP 服务器（Copilot Chat）随会话自动启动
+ *
+ * 问题背景：VS Code 原生 MCP 默认按需启动——`chat.mcp.autostart` 的默认值是
+ * `onlyNew`，即只有"从未运行过"的 MCP 服务器会在提交聊天时自动启动一次；
+ * 之后每次重新打开 VS Code / 重载窗口，已配置但未运行的 codegraph 服务器
+ * 都不会自动拉起，必须手动刷新或等待用户手动触发，表现为"每次打开不能
+ * 自动启动 codegraph MCP"。
+ *
+ * 解决方案：把 `chat.mcp.autostart` 设为 `newAndOutdated`——新会话自动启动
+ * 所有尚未运行的 MCP 服务器。只在用户从未显式设置过该值（undefined，即走
+ * 默认 `onlyNew`）时写入；用户显式选择过的值（包括 `never`）一律尊重，
+ * 不做覆盖。
+ *
+ * 为什么用 workspace.getConfiguration 检查 undefined 而非直接读 settings.json：
+ * 该设置可能来自 Settings Sync、默认值合并等多种来源，直接检查配置解析结果
+ * 是否为 undefined 是判断"用户是否显式设置过"的标准方式。
+ */
+function ensureVSCodeMcpAutostart(): void {
+  try {
+    const config = vscode.workspace.getConfiguration('chat.mcp');
+    const current = config.inspect<string>('autostart');
+
+    // 用户在任何层级（全局/工作区/工作区文件夹）显式设置过则完全不动。
+    // 注意：inspect().globalValue 等字段在未显式设置时为 undefined，
+    // 此时 VS Code 运行时使用内置默认值 onlyNew —— 正是需要修正的场景。
+    if (current?.globalValue !== undefined ||
+        current?.workspaceValue !== undefined ||
+        current?.workspaceFolderValue !== undefined) {
+      return;
+    }
+
+    // 仅当 VS Code 原生 MCP 配置确实存在 codegraph 时才写此设置，
+    // 避免给未使用 VS Code 原生 MCP 的用户引入无关配置项
+    if (config.get('access') === 'none') {
+      return; // MCP 整体被禁用，写了也不会启动，跳过
+    }
+
+    // 写入应用级（User scope）设置：MCP 服务器是用户级资源，
+    // autostart 也应跟随用户级而非某个工作区
+    void config.update('autostart', 'newAndOutdated', vscode.ConfigurationTarget.Global);
+    console.log('[CodeGraph] 已启用 chat.mcp.autostart=newAndOutdated，VS Code 将在会话开始时自动启动 codegraph MCP 服务器');
+  } catch (err) {
+    // 设置写入失败不应阻断代理配置流程（例如某些受限环境禁用配置 API）
+    console.warn('[CodeGraph] 设置 chat.mcp.autostart 失败:', err);
+  }
 }
 
 function isVSCodeInstalled(): boolean {
@@ -1300,6 +1347,13 @@ export async function configureAgents(
     // 传入 codegraphPath（绝对路径）：VS Code 等代理用它作为 MCP command，
     // 避免 VS Code Server PATH 不含 ~/.local/bin 时 spawn ENOENT
     const result = agent.configure(codegraphPath);
+
+    // VS Code 专属：配置成功时顺带确保 chat.mcp.autostart 允许自动启动，
+    // 否则原生 MCP 默认 onlyNew 只在首次运行，重开 VS Code 后不自动拉起
+    if (agent.name === 'VS Code' && result.success) {
+      ensureVSCodeMcpAutostart();
+    }
+
     results.push({
       name: agent.name,
       action: result.action,

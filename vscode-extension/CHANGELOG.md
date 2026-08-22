@@ -5,6 +5,17 @@
 
 ---
 
+### 0.9.33 (2026-08-22)
+- 修复 VS Code 原生 MCP 服务器每次打开不自动启动
+  - 根因：Copilot Chat 的 `chat.mcp.autostart` 默认值为 `onlyNew`——只有"从未运行过"的 MCP 服务器会在提交聊天时自动启动一次；之后每次重开 VS Code / 重载窗口，已配置但未运行的 codegraph 服务器都不会自动拉起，需手动刷新或手动触发，表现为"每次打开不能自动启动"
+  - 修复：扩展激活时的后台代理配置流程中，检测 `chat.mcp.autostart` —— 用户从未显式设置过（inspect 各层级值均为 undefined，走默认 `onlyNew`）时写入 `newAndOutdated`（新会话自动启动所有未运行的 MCP 服务器）；用户显式选择过的值（含 `never`）一律尊重不覆盖
+  - 仅在 VS Code 原生 MCP 配置存在 codegraph 且 MCP 未被整体禁用（`chat.mcp.access != none`）时写入，不给无关用户引入配置项
+  - 其他代理排查结论：opencode / Kilo Code 配置自带 `enabled: true`；Claude Code / Cursor / Codex / Gemini / Hermes / Kiro / Qoder / Trae 等的 stdio MCP 随主进程按需拉起，均不存在此问题。唯一受影响的就是 VS Code 原生 MCP（含 Agent Host）
+- **变更文件**:
+  - `src/agentConfig.ts` - 新增 `ensureVSCodeMcpAutostart()`（inspect 检测未显式设置 → 写入 newAndOutdated），configureAgents 中 VS Code 代理配置成功后调用
+  - `package.json` - 版本 0.9.32 -> 0.9.33
+
+---
 ### 0.9.32 (2026-08-17)
 - 修复「建立索引」在文件监视禁用环境下永久挂起（严重）
   - 根因：`codegraph init` 索引完成后调用 `offerWatchFallback`，在 git 仓库且文件监视被禁用（WSL2 `/mnt/*` 项目、`CODEGRAPH_NO_WATCH=1`）时弹出 `clack.select` 交互选择（"如何保持索引新鲜？"）。扩展以管道 stdin（非 TTY）spawn 子进程，clack.select 在非 TTY 下**永久挂起**等待按键（实测 8s+ 不返回、进程不退出），「建立索引」永久卡死
