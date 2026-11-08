@@ -16,22 +16,90 @@ import * as path from 'path';
 import { JsonRpcRequest, JsonRpcNotification, JsonRpcTransport, ErrorCodes } from './transport';
 import { MCPEngine } from './engine';
 import { tools } from './tools';
-import { SERVER_INSTRUCTIONS } from './server-instructions';
+import { SERVER_INSTRUCTIONS, SERVER_INSTRUCTIONS_NO_ROOT_INDEX } from './server-instructions';
 import { CodeGraphPackageVersion } from './version';
+import { resolveServerRoot } from '../directory';
+import { getTelemetry, ClientInfo } from '../telemetry';
+import { getUpdateNotice } from '../upgrade/update-check';
+import { ExploreSessionState } from './explore-session-state';
+import { IndexVersionWarningState } from './index-version-warning';
+
+/**
+ * The site's favicon on a light tile: the bare mark is dark ink on nothing,
+ * which a dark UI loses. Written out rather than as base64 so a reader can see
+ * it is two lines of shapes and nothing else.
+ */
+const SERVER_ICON_SVG =
+  '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" fill="none" stroke="#16150f" stroke-width="2">' +
+  '<rect width="32" height="32" rx="6" fill="#f7f6f2" stroke="none"/>' +
+  '<line x1="16" y1="8" x2="8" y2="23"/><line x1="16" y1="8" x2="24" y2="23"/><line x1="8" y1="23" x2="24" y2="23"/>' +
+  '<circle cx="16" cy="8" r="3.4" fill="#16150f"/><circle cx="8" cy="23" r="3.4" fill="#f7f6f2"/><circle cx="24" cy="23" r="3.4" fill="#f7f6f2"/>' +
+  '</svg>';
 
 /**
  * MCP Server Info — kept on the session because some clients log it. The
  * version tracks the real package version (was a hard-coded '0.1.0').
+ *
+ * `title` and `icons` are what a host may show in place of `name`. They are
+ * newer than the protocol version this server claims, so a host that doesn't
+ * know them passes over them. The icon has no `sizes`: it is optional and says
+ * nothing about an SVG, and a host on an SDK that typed it as a string, as 1.18
+ * did, would fail the whole handshake on the array the spec settled on.
  */
 // Exported so the proxy can answer `initialize` locally with the IDENTICAL
 // payload the daemon would send — no drift between the two handshake paths.
 export const SERVER_INFO = {
   name: 'codegraph',
+  title: 'CodeGraph',
   version: CodeGraphPackageVersion,
+  icons: [
+    {
+      src: `data:image/svg+xml;base64,${Buffer.from(SERVER_ICON_SVG).toString('base64')}`,
+      mimeType: 'image/svg+xml',
+    },
+  ],
 };
+
+/**
+ * Instructions for the `initialize` response, with the update-availability
+ * notice appended when one is known (#1243). Exported so the proxy's local
+ * handshake sends the IDENTICAL payload — same convention as SERVER_INFO.
+ * `getUpdateNotice` is a memoized synchronous cache read, so the #172
+ * respond-fast contract holds; when no notice exists the instructions are
+ * byte-identical to the bare constants.
+ *
+ * Test-authoring note: on a machine whose real `~/.codegraph` cache knows a
+ * newer release, spawned servers append the notice — a test asserting exact
+ * instructions equality must set `CODEGRAPH_NO_UPDATE_CHECK=1` in the spawn
+ * env or it will fail only in the weeks after a release ships.
+ */
+export function initializeInstructions(base: string, notice: string | null = getUpdateNotice()): string {
+  if (!notice) return base;
+  return (
+    `${base}\n\n---\n${notice} This server keeps running the old version until ` +
+    `the user upgrades — mention it when convenient; do not run the upgrade yourself.`
+  );
+}
 
 /** MCP Protocol Version (latest the server claims). */
 export const PROTOCOL_VERSION = '2024-11-05';
+
+/** The invalid-params message for {@link toolCallArguments}' null. */
+export const TOOL_ARGUMENTS_NOT_OBJECT = 'Tool arguments must be an object';
+
+/**
+ * The arguments a `tools/call` passes, or null when they are not an object.
+ * A string, number or array there is a malformed request, the client's to
+ * fix, so it is answered with a JSON-RPC invalid-params error, as a call that
+ * names no tool is, and never run: run, a string made the tool handler throw,
+ * which came back as an internal codegraph error to retry (#2981). Exported so
+ * the proxy, serving in process while the daemon is unavailable, answers it
+ * the same way. No arguments (missing, null or another empty value) are none.
+ */
+export function toolCallArguments(params: { arguments?: unknown }): Record<string, unknown> | null {
+  const args = params.arguments || {};
+  return typeof args === 'object' && !Array.isArray(args) ? (args as Record<string, unknown>) : null;
+}
 
 /**
  * How long to wait for the client's `roots/list` response before giving up
@@ -81,9 +149,22 @@ export interface MCPSessionOptions {
  */
 export class MCPSession {
   private clientSupportsRoots = false;
+  /** From the initialize handshake — attributes usage rollups to the agent host. */
+  private clientInfo: ClientInfo | undefined;
   private rootsAttempted = false;
   private resolvePromise: Promise<void> | null = null;
   private explicitProjectPath: string | null;
+  /**
+   * What `codegraph_explore` has already returned to THIS client, per project
+   * (CG-17). Owned by the session, not the engine: the daemon shares one engine
+   * (and one ToolHandler, and a pool of worker threads) across every connected
+   * client, so state kept over there would blend two agents' histories and let
+   * one session's calls suppress source the other has never seen. It dies with
+   * the session — a reconnecting client starts clean.
+   */
+  private readonly exploreSession = new ExploreSessionState();
+  /** One-time stale-index warnings already delivered to this MCP client. */
+  private readonly indexVersionWarnings = new IndexVersionWarningState();
 
   constructor(
     private transport: JsonRpcTransport,
@@ -112,6 +193,15 @@ export class MCPSession {
   /** Underlying transport — exposed for daemon-side close hooks. */
   getTransport(): JsonRpcTransport {
     return this.transport;
+  }
+
+  /**
+   * This session's explore call history (CG-17). Exposed so tests can assert
+   * that two sessions on one daemon keep separate state; nothing in the server
+   * reaches for another session's copy.
+   */
+  getExploreSessionState(): ExploreSessionState {
+    return this.exploreSession;
   }
 
   private async handleMessage(message: JsonRpcRequest | JsonRpcNotification): Promise<void> {
@@ -161,9 +251,16 @@ export class MCPSession {
       rootUri?: string;
       workspaceFolders?: Array<{ uri: string; name: string }>;
       capabilities?: { roots?: unknown };
+      clientInfo?: { name?: unknown; version?: unknown };
     } | undefined;
 
     this.clientSupportsRoots = !!params?.capabilities?.roots;
+    if (params?.clientInfo) {
+      this.clientInfo = {
+        name: typeof params.clientInfo.name === 'string' ? params.clientInfo.name : undefined,
+        version: typeof params.clientInfo.version === 'string' ? params.clientInfo.version : undefined,
+      };
+    }
 
     // Explicit project signal, strongest first: client-provided rootUri /
     // workspaceFolders (LSP-style), else the --path the server was launched
@@ -178,12 +275,32 @@ export class MCPSession {
       explicitPath = this.explicitProjectPath;
     }
 
+    // Pick the instructions variant by the root's index state — synchronous
+    // and bounded (an existsSync walk-up plus, when that misses, the depth- and
+    // count-bounded workspace down-scan; no DB open, so the #172 respond-fast
+    // contract holds). This is the SAME resolution the engine's doInitialize
+    // runs (#1606), so the variant matches what the engine will actually adopt
+    // — a workspace whose single indexed sub-project becomes the default gets
+    // the full single-project playbook, race-free by construction (both sides
+    // compute it independently; no ordering between handshake and engine init
+    // is assumed). When the root ISN'T indexed (and nothing was adopted), send
+    // the per-project variant (tools are still exposed — see handleToolsList):
+    // it tells the agent there is no default project and to pass `projectPath`
+    // to any project that has a `.codegraph/`. Gating tool AVAILABILITY on
+    // whether `./` is indexed was the #964 bug — it broke monorepos (only
+    // sub-projects indexed) and never surfaced the tools after a mid-session
+    // `codegraph init`. When no explicit path is known yet (roots/list dance
+    // pending), cwd is the best predictor of where the default will resolve.
+    // A root in a sensitive folder resolves to null here as in the engine, so
+    // that session gets the no-default-project variant too.
+    const indexed = resolveServerRoot(explicitPath ?? process.cwd()).root !== null;
+
     // Respond to the handshake BEFORE doing any heavy init — see issue #172.
     this.transport.sendResult(request.id, {
       protocolVersion: PROTOCOL_VERSION,
       capabilities: { tools: {} },
       serverInfo: SERVER_INFO,
-      instructions: SERVER_INSTRUCTIONS,
+      instructions: initializeInstructions(indexed ? SERVER_INSTRUCTIONS : SERVER_INSTRUCTIONS_NO_ROOT_INDEX),
     });
 
     if (explicitPath) {
@@ -196,6 +313,17 @@ export class MCPSession {
 
   private async handleToolsList(request: JsonRpcRequest): Promise<void> {
     await this.retryInitIfNeeded();
+    // Always expose the tools — even when the server root has no index. Gating
+    // availability on whether `./` is indexed (the old behavior) breaks the
+    // monorepo case where only sub-projects carry a `.codegraph/` (the agent
+    // saw zero tools and couldn't even reach an indexed sub-project by
+    // `projectPath`), and it hides the tools from a session that started before
+    // the user ran `codegraph init` (most hosts request the list once, so the
+    // freshly-built index never surfaces). #964. The not-indexed case is still
+    // safe: a call against an un-indexed path returns SUCCESS-shaped guidance
+    // ("pass projectPath / run codegraph init"), never `isError`, so it can't
+    // teach the agent to abandon codegraph. `getTools()` returns the default
+    // surface even before a project is open.
     this.transport.sendResult(request.id, {
       tools: this.engine.getToolHandler().getTools(),
     });
@@ -213,7 +341,11 @@ export class MCPSession {
     }
 
     const toolName = params.name;
-    const toolArgs = params.arguments || {};
+    const toolArgs = toolCallArguments(params);
+    if (!toolArgs) {
+      this.transport.sendError(request.id, ErrorCodes.InvalidParams, TOOL_ARGUMENTS_NOT_OBJECT);
+      return;
+    }
 
     const tool = tools.find((t) => t.name === toolName);
     if (!tool) {
@@ -225,10 +357,21 @@ export class MCPSession {
       return;
     }
 
+    if (process.env.CODEGRAPH_MCP_DEBUG) process.stderr.write(`[mcp-debug] toolsCall ${toolName} id=${String(request.id)} pre-init\n`);
     await this.retryInitIfNeeded();
 
-    const result = await this.engine.getToolHandler().execute(toolName, toolArgs);
+    if (process.env.CODEGRAPH_MCP_DEBUG) process.stderr.write(`[mcp-debug] toolsCall ${toolName} id=${String(request.id)} dispatch\n`);
+    const result = await this.engine.getToolHandler().execute(
+      toolName,
+      toolArgs,
+      this.exploreSession,
+      this.indexVersionWarnings,
+    );
+    if (process.env.CODEGRAPH_MCP_DEBUG) process.stderr.write(`[mcp-debug] toolsCall ${toolName} id=${String(request.id)} done\n`);
     this.transport.sendResult(request.id, result);
+    // After the reply is on the wire — telemetry must never delay a tool
+    // response (in-memory increment only; see src/telemetry).
+    getTelemetry().recordUsage('mcp_tool', toolName, !result.isError, this.clientInfo);
   }
 
   /**

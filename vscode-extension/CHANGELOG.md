@@ -5,6 +5,24 @@
 
 ---
 
+### 0.9.34 (2026-11-08)
+- 同步上游 CodeGraph 至 v1.6.2 并完成扩展适配（上游 1435 个提交，CLI 0.9.x -> 1.6.2）
+  - 上游 CLI 接口总体兼容：`init` / `sync` / `serve --mcp` 与 8 个 `codegraph_*` MCP 工具名均未变；`tools/list` 改为按项目规模动态暴露（小项目只列 `codegraph_explore`），但 `tools/call` 仍接受全部工具，扩展按名直调不受影响
+- 修复上游 1.x 导致的 4 处不兼容
+  - **搜索解析全部失效**：搜索结果条目标题由 `### name (kind)` 改为 `**name** (kind)`，旧正则匹配不到任何条目 → 解析前按行归一化，同时兼容新旧 CLI
+  - **符号树报错**：上游 MCP 参数校验拒绝空字符串，`query: ''` 直接返回 isError → 改传单个空格（`parseQuery(' ')` 分词后仍为空文本，服务端照旧走 `searchAllByFilters` 返回全部符号）
+  - **索引挂起风险**：`init -i` 已废弃（初始化默认建索引），改用新增的 `init -y` 非交互模式，从源头规避 clack 在非 TTY stdin 下挂起；`runCliCommand` 的回车/EOF 注入仅保留为旧版 CLI 兜底
+  - **npm 兜底安装必然失败**：`@luowei729/codegraph` 在 npm 注册表不存在（404）→ 改为真实存在的 `@colbymchenry/codegraph`
+- 兼容上游新增索引目录：`isCodeGraphInitialized` / `deleteIndex` 同时识别 `.codegraph`、WSL 专用 `.codegraph-wsl` 与 `CODEGRAPH_DIR` 自定义目录
+- 修复历史解析 bug：搜索条目位置正则 `(.+?)` 因签名组可选只匹配 1 个字符（文件路径退化成首字母），改为贪婪不跨行的 `([^\n]+)`
+- 安装脚本合并：上游 `install.sh` 重构（清理旧版本目录 + PATH 遮蔽检测）基础上，保留 fork 的「PATH 自动写入 shell 配置文件」能力
+- **变更文件**:
+  - `src/commands.ts` / `src/treeProvider.ts` - 搜索格式归一化 + 位置正则修复 + 符号树空查询兼容
+  - `src/codegraphManager.ts` - `init -y`、npm 包名修正、多索引目录检测/清理
+  - `package.json` / `package-lock.json` - 版本 0.9.33 -> 0.9.34
+- **验证**: Node 22 构建上游 CLI（`npm run build`）、installer-targets 测试 630 通过、真机 MCP 端到端（initialize / tools/list / search / callers / callees / impact / files）、扩展 `tsc` 类型检查通过、VSIX 打包成功
+
+---
 ### 0.9.33 (2026-08-22)
 - 修复 VS Code 原生 MCP 服务器每次打开不自动启动
   - 根因：Copilot Chat 的 `chat.mcp.autostart` 默认值为 `onlyNew`——只有"从未运行过"的 MCP 服务器会在提交聊天时自动启动一次；之后每次重开 VS Code / 重载窗口，已配置但未运行的 codegraph 服务器都不会自动拉起，需手动刷新或手动触发，表现为"每次打开不能自动启动"

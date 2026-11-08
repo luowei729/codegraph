@@ -16,11 +16,27 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { CodeGraph } from '../src';
+import { once } from 'events';
+import { WASM_RUNTIME_FLAGS } from '../src/extraction/wasm-runtime-flags';
+import { SERVER_INFO } from '../src/mcp/session';
 
 const BIN = path.resolve(__dirname, '../dist/bin/codegraph.js');
 
+/** The fields of `serverInfo` a host can draw. */
+function expectServerBranding(info: { title?: string; icons?: Array<Record<string, unknown>> }): void {
+  expect(info.title).toBe('CodeGraph');
+  expect(info.icons).toHaveLength(1);
+  const icon = info.icons![0]!;
+  expect(icon.mimeType).toBe('image/svg+xml');
+  expect(String(icon.src)).toMatch(/^data:image\/svg\+xml;base64,/);
+  const svg = Buffer.from(String(icon.src).split(',')[1]!, 'base64').toString('utf8');
+  expect(svg).toMatch(/^<svg\b/);
+  // `sizes` is left off on purpose: see SERVER_INFO.
+  expect(Object.keys(icon).sort()).toEqual(['mimeType', 'src']);
+}
+
 function spawnServer(cwd: string): ChildProcessWithoutNullStreams {
-  return spawn(process.execPath, [BIN, 'serve', '--mcp'], {
+  return spawn(process.execPath, [...WASM_RUNTIME_FLAGS, BIN, 'serve', '--mcp'], {
     cwd,
     stdio: ['pipe', 'pipe', 'pipe'],
     // Pin to direct (in-process) mode. #172 is a contract about the in-process
@@ -99,6 +115,41 @@ function waitFor<T>(
   });
 }
 
+/**
+ * Remove `dir` once nothing holds it. Even after the killed server's 'close',
+ * Windows can keep the dir itself busy a moment longer under load, and
+ * `fs.rmSync`'s `maxRetries` never retries EBUSY on a directory: it throws at
+ * once. A dir still held at the deadline fails the test.
+ */
+async function removeWhenReleased(dir: string, timeoutMs = 5000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+      return;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code ?? '';
+      if (!['EBUSY', 'ENOTEMPTY', 'EPERM'].includes(code) || Date.now() > deadline) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+  }
+}
+
+describe('MCP server title and icon', () => {
+  it('names the server and carries an icon no host has to fetch', () => {
+    expectServerBranding(SERVER_INFO);
+  });
+
+  it('keeps the machine name hosts key on, and nothing but shapes in the icon', () => {
+    expect(SERVER_INFO.name).toBe('codegraph');
+    const svg = Buffer.from(SERVER_INFO.icons[0]!.src.split(',')[1]!, 'base64').toString('utf8');
+    expect(svg.match(/<\w+/g)?.sort()).toEqual(
+      ['<circle', '<circle', '<circle', '<line', '<line', '<line', '<rect', '<svg'],
+    );
+    expect(svg).not.toMatch(/href|url\(|on\w+=|style/i);
+  });
+});
+
 describe('MCP initialize handshake (issue #172)', () => {
   let tempDir: string;
   let child: ChildProcessWithoutNullStreams | null = null;
@@ -107,12 +158,16 @@ describe('MCP initialize handshake (issue #172)', () => {
     tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-mcp-init-'));
   });
 
-  afterEach(() => {
-    if (child && !child.killed) {
+  afterEach(async () => {
+    // Spawn with the runtime flags so this is the server, not a relauncher
+    // whose grandchild would retain the Windows cwd/database handles.
+    if (child && child.exitCode === null && child.signalCode === null) {
+      const closed = once(child, 'close');
       child.kill('SIGKILL');
-      child = null;
+      await closed;
     }
-    fs.rmSync(tempDir, { recursive: true, force: true });
+    child = null;
+    await removeWhenReleased(tempDir);
   });
 
   it('responds to initialize quickly when no .codegraph exists in cwd', async () => {
@@ -153,6 +208,7 @@ describe('MCP initialize handshake (issue #172)', () => {
     const json = JSON.parse(response.text);
     expect(json.id).toBe(0);
     expect(json.result.serverInfo.name).toBe('codegraph');
+    expectServerBranding(json.result.serverInfo);
   }, 20000);
 
   it('answers resources/list and prompts/list with empty lists, not -32601 (issue #621)', async () => {
@@ -180,4 +236,20 @@ describe('MCP initialize handshake (issue #172)', () => {
     expect(prompts.error).toBeUndefined();
     expect(prompts.result.prompts).toEqual([]);
   }, 15000);
+});
+
+describe('MCP initialize teardown', () => {
+  // On Windows a dir another process holds (here as its cwd) refuses removal
+  // with EBUSY; the teardown waits until it is let go.
+  it.runIf(process.platform === 'win32')('removes a dir once the process holding it has exited', async () => {
+    const held = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-mcp-init-held-'));
+    const holder = spawn(process.execPath, ['-e', "process.stdout.write('ready'); setTimeout(() => {}, 500)"], {
+      cwd: held,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    await once(holder.stdout, 'data'); // running, so its cwd is open
+    expect(() => fs.rmdirSync(held)).toThrow(/EBUSY/);
+    await removeWhenReleased(held);
+    expect(fs.existsSync(held)).toBe(false);
+  });
 });

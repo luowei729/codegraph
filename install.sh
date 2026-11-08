@@ -34,6 +34,11 @@ arch="$(uname -m)"
 case "$os" in
   Darwin) os="darwin" ;;
   Linux)  os="linux" ;;
+  MINGW*|MSYS*|CYGWIN*)
+    echo "codegraph: on Windows, open PowerShell and run:" >&2
+    echo "  irm https://raw.githubusercontent.com/colbymchenry/codegraph/main/install.ps1 | iex" >&2
+    exit 1
+    ;;
   *) echo "codegraph: unsupported OS '$os'." >&2; exit 1 ;;
 esac
 case "$arch" in
@@ -84,72 +89,120 @@ ln -sfn "$dest" "$INSTALL_DIR/current"
 echo "Installed to $dest"
 echo "Linked     $BIN_DIR/codegraph"
 
-# 5. 自动将 BIN_DIR 添加到 PATH（写入 shell 配置文件）
-# 这样 codegraph 命令可以在终端、VS Code、Cursor、Claude Code 等环境中被找到
-case ":$PATH:" in
-  *":$BIN_DIR:"*)
-    echo "$BIN_DIR 已在 PATH 中"
-    ;;
-  *)
-    echo ""
-    echo "$BIN_DIR 不在 PATH 中，正在自动添加..."
-    
-    # 检测当前使用的 shell 并写入对应的配置文件
-    current_shell="$(basename "${SHELL:-/bin/sh}")"
-    added=false
-    
-    # 函数：检查并添加 PATH 到配置文件
-    add_path_to_file() {
-      local file="$1"
-      local export_line="export PATH=\"$BIN_DIR:\$PATH\""
-      
-      if [ -f "$file" ]; then
-        # 检查是否已经存在
-        if grep -qF "$BIN_DIR" "$file" 2>/dev/null; then
-          echo "  已在 $file 中配置"
-          return 0
-        fi
-        # 添加 PATH
-        echo "" >> "$file"
-        echo "# CodeGraph - added by install.sh on $(date '+%Y-%m-%d %H:%M:%S')" >> "$file"
-        echo "$export_line" >> "$file"
-        echo "  已添加到 $file"
+# 5. Prune older bundles so they don't pile up across upgrades (issue #1074).
+# Each release lives in its own versions/<v> dir (~50 MB with the vendored Node
+# runtime). `codegraph upgrade` re-runs this script, which drops in a new dir
+# and re-points `current` + the launcher — but it never removed the old dirs, so
+# they accumulated indefinitely. Keep only what we just installed ($dest) and
+# delete the rest. Safe even if a daemon is still executing an older bundle: on
+# POSIX the inode stays alive until that process exits, so removing the dir can't
+# break a running process. (Windows installs overwrite a single dir in place and
+# never reach this.) The markers below let a unit test run this exact block.
+# >>> CODEGRAPH_PRUNE_OLD_VERSIONS
+pruned=0
+if [ -d "$INSTALL_DIR/versions" ]; then
+  for d in "$INSTALL_DIR/versions"/*; do
+    [ -d "$d" ] || continue
+    if [ "$d" != "$dest" ]; then
+      if rm -rf "$d"; then
+        pruned=$((pruned + 1))
+      fi
+    fi
+  done
+fi
+if [ "$pruned" -gt 0 ]; then
+  echo "Removed    $pruned older version(s)"
+fi
+# <<< CODEGRAPH_PRUNE_OLD_VERSIONS
+
+# 6. PATH sanity. Two ways this install can fail to be the codegraph that runs:
+#   1. $BIN_DIR isn't on PATH at all.
+#   2. A *different* codegraph sits earlier on PATH and shadows ours — most
+#      often a stale `npm i -g @colbymchenry/codegraph`, whose launcher keeps
+#      running its own version-pinned bundle, so `codegraph --version` disagrees
+#      with what we just installed (issue #1071).
+# Walk PATH once: note whether $BIN_DIR is present and which codegraph wins.
+on_path=0
+winner=""
+oldifs="$IFS"; IFS=:
+for dir in $PATH; do
+  [ -n "$dir" ] || continue
+  if [ "$dir" = "$BIN_DIR" ]; then on_path=1; fi
+  if [ -z "$winner" ] && [ -x "$dir/codegraph" ] && [ ! -d "$dir/codegraph" ]; then
+    winner="$dir/codegraph"
+  fi
+done
+IFS="$oldifs"
+
+if [ "$on_path" -eq 0 ]; then
+  echo ""
+  echo "$BIN_DIR is not on your PATH. Add it:"
+  echo "  export PATH=\"$BIN_DIR:\$PATH\""
+
+  # 本 fork 增强：自动把 BIN_DIR 写入当前 shell 的启动配置文件。
+  # 为什么？codegraph 常被 VS Code / Cursor / Claude Code 等图形化工具
+  # 以非登录 shell 拉起，这些进程不读 shell 的交互式配置；不自动写入
+  # PATH 时用户会反复遇到 "Executable not found in $PATH"。
+  # 仅在 BIN_DIR 确实不在 PATH 时执行，已有配置绝不重复追加。
+  echo ""
+  echo "$BIN_DIR 不在 PATH 中，正在自动添加..."
+  current_shell="$(basename "${SHELL:-/bin/sh}")"
+  added=false
+
+  # 检查并写入单个配置文件（已含 BIN_DIR 则跳过，保证幂等）
+  add_path_to_file() {
+    local file="$1"
+    local export_line="export PATH=\"$BIN_DIR:\$PATH\""
+
+    if [ -f "$file" ]; then
+      if grep -qF "$BIN_DIR" "$file" 2>/dev/null; then
+        echo "  已在 $file 中配置"
         return 0
       fi
-      return 1
-    }
-    
-    # 根据 shell 类型写入配置文件
-    case "$current_shell" in
-      zsh)
-        add_path_to_file "$HOME/.zshrc" && added=true
-        add_path_to_file "$HOME/.zprofile" && added=true
-        ;;
-      bash)
-        add_path_to_file "$HOME/.bashrc" && added=true
-        add_path_to_file "$HOME/.bash_profile" && added=true
-        add_path_to_file "$HOME/.profile" && added=true
-        ;;
-      *)
-        # 通用配置
-        add_path_to_file "$HOME/.profile" && added=true
-        add_path_to_file "$HOME/.bashrc" && added=true
-        ;;
-    esac
-    
-    if [ "$added" = true ]; then
-      echo ""
-      echo "✓ PATH 已自动配置。请执行以下操作之一使配置生效："
-      echo "  - 重新打开终端"
-      echo "  - 或运行: source ~/.bashrc (或 ~/.zshrc)"
-      echo "  - 或重启 VS Code / Cursor / Claude Code"
-    else
-      echo ""
-      echo "⚠ 无法自动配置 PATH，请手动添加："
-      echo "  export PATH=\"$BIN_DIR:\$PATH\""
+      echo "" >> "$file"
+      echo "# CodeGraph - added by install.sh on $(date '+%Y-%m-%d %H:%M:%S')" >> "$file"
+      echo "$export_line" >> "$file"
+      echo "  已添加到 $file"
+      return 0
     fi
-    ;;
-esac
+    return 1
+  }
+
+  # 根据 shell 类型选择配置文件
+  case "$current_shell" in
+    zsh)
+      add_path_to_file "$HOME/.zshrc" && added=true
+      add_path_to_file "$HOME/.zprofile" && added=true
+      ;;
+    bash)
+      add_path_to_file "$HOME/.bashrc" && added=true
+      add_path_to_file "$HOME/.bash_profile" && added=true
+      add_path_to_file "$HOME/.profile" && added=true
+      ;;
+    *)
+      add_path_to_file "$HOME/.profile" && added=true
+      add_path_to_file "$HOME/.bashrc" && added=true
+      ;;
+  esac
+
+  if [ "$added" = true ]; then
+    echo ""
+    echo "✓ PATH 已自动配置。请执行以下操作之一使配置生效："
+    echo "  - 重新打开终端"
+    echo "  - 或运行: source ~/.bashrc (或 ~/.zshrc)"
+    echo "  - 或重启 VS Code / Cursor / Claude Code"
+  else
+    echo ""
+    echo "⚠ 无法自动配置 PATH，请手动添加上面的 export 行"
+  fi
+elif [ -n "$winner" ] && [ "$winner" != "$BIN_DIR/codegraph" ]; then
+  echo ""
+  echo "Warning: another codegraph is earlier on your PATH and will run instead:"
+  echo "  $winner"
+  echo "  (this install: $BIN_DIR/codegraph)"
+  echo "If 'codegraph --version' shows an unexpected version, remove the other copy"
+  echo "(e.g. 'npm rm -g @colbymchenry/codegraph') or put $BIN_DIR first on PATH."
+fi
 
 echo ""
 echo "Done. Run: codegraph --help"

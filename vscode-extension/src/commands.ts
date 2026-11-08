@@ -106,11 +106,22 @@ interface ParsedSymbol {
  */
 function parseSearchResults(text: string): ParsedSymbol[] {
   const results: ParsedSymbol[] = [];
-  // Match each ### heading block with its file path and optional signature
-  const entryRegex = /### (.+?) \((\w+)\)\n(.+?)(?:\n`(.+?)`)?/g;
+  // 兼容性归一化（上游 CodeGraph 1.x 起）：搜索条目标题从
+  //   ### symbolName (kind)        （0.9.x）
+  // 改成了
+  //   **symbolName** (kind)       （1.x 紧凑格式）
+  // 这里把新格式逐行还原成旧标题，后续仍复用同一套解析逻辑，
+  // 从而同时兼容新旧两代 CLI，避免用户升级 CLI 后搜索树空白。
+  // 只匹配「整行加粗 + 括号类型」的形式，不会误伤签名等正文内容。
+  const normalized = text.replace(/^\*\*(.+?)\*\* \((\w+)\)\s*$/gm, '### $1 ($2)');
+  // Fix#18: 位置行必须用「贪婪且不跨行」的 [^\n]+ 匹配。
+  // 旧正则用 (.+?) 且签名组可选，正则引擎只需匹配 1 个字符就能整体成功，
+  // 导致 filePath 永远只解析出首字符（如 "s"），跳转/展示全部错位。
+  // [^\n]+ 会吃完整个位置行，签名组再吃掉下一行的反引号内容，语义正确。
+  const entryRegex = /### (.+?) \((\w+)\)\n([^\n]+)(?:\n`([^\n]+)`)?/g;
   let match: RegExpExecArray | null;
 
-  while ((match = entryRegex.exec(text)) !== null) {
+  while ((match = entryRegex.exec(normalized)) !== null) {
     const name = match[1];
     const kind = match[2];
     const location = match[3].trim();

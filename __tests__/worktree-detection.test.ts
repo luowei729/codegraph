@@ -18,8 +18,11 @@ import * as os from 'os';
 import * as path from 'path';
 import {
   detectWorktreeIndexMismatch,
+  nestedRepositoryBelow,
   worktreeMismatchWarning,
+  worktreeMismatchNotice,
   gitWorktreeRoot,
+  gitCommonDir,
 } from '../src/sync/worktree';
 import CodeGraph from '../src/index';
 import { ToolHandler } from '../src/mcp/tools';
@@ -100,7 +103,92 @@ describe('detectWorktreeIndexMismatch (issue #155)', () => {
     const msg = worktreeMismatchWarning(detectWorktreeIndexMismatch(worktree, mainRepo)!);
     expect(msg).toContain(real(worktree));
     expect(msg).toContain(real(mainRepo));
-    expect(msg).toContain('codegraph init');
+    expect(msg).toContain('Run "codegraph init" in this worktree');
+    expect(msg).not.toContain('init -i');
+  });
+
+  it('words the fix as the user\'s option when an agent reads it', () => {
+    const m = detectWorktreeIndexMismatch(worktree, mainRepo)!;
+    expectAgentAdvice(worktreeMismatchWarning(m, 'agent'));
+    expectAgentAdvice(worktreeMismatchNotice(m));
+  });
+});
+
+/**
+ * What an agent is told about a borrowed index. Indexing is the user's
+ * decision (the server instructions tell the agent not to run `codegraph init`
+ * itself), so the text says the user can build a worktree-local index, never
+ * tells the agent to, and doesn't name the `-i` flag, which does nothing now.
+ */
+function expectAgentAdvice(text: string): void {
+  expect(text).toContain('The user can run "codegraph init" in this worktree');
+  expect(text).not.toContain('Run "codegraph init');
+  expect(text).not.toContain('init -i');
+}
+
+/**
+ * Windows spells one directory several ways. VS Code and Cursor pass a
+ * lowercase drive letter (`d:\repo`), a `subst` drive is a second name for a
+ * folder, and NTFS ignores case, while git answers with the spelling on disk.
+ * Compared as strings, a linked worktree spelled unlike git looked like a
+ * different directory: `status` lost the borrowed-index warning, and the MCP
+ * tools refused the worktree as an unindexed repository of its own (#2517).
+ * A lowercase drive letter needs no `subst` mapping or admin rights to show it.
+ */
+describe('a linked worktree spelled with a lowercase drive letter (#2517)', () => {
+  let mainRepo: string;
+  let worktree: string;
+  let embedded: string; // a different repository nested below: still reported
+  const lowerDrive = (p: string) => p.charAt(0).toLowerCase() + p.slice(1);
+
+  beforeEach(() => {
+    mainRepo = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-wt-2517-'));
+    git(mainRepo, 'init', '-q');
+    git(mainRepo, 'config', 'user.email', 'test@example.com');
+    git(mainRepo, 'config', 'user.name', 'Test');
+    git(mainRepo, 'config', 'commit.gpgsign', 'false');
+    fs.writeFileSync(path.join(mainRepo, '.gitignore'), 'wt/\nembedded/\n');
+    fs.mkdirSync(path.join(mainRepo, 'src'));
+    fs.writeFileSync(path.join(mainRepo, 'src', 'a.ts'), 'export const a = 1;\n');
+    git(mainRepo, 'add', '.');
+    git(mainRepo, 'commit', '-q', '-m', 'init');
+    worktree = path.join(mainRepo, 'wt');
+    git(mainRepo, 'worktree', 'add', '-q', '-b', 'feature', worktree);
+    embedded = path.join(mainRepo, 'embedded');
+    fs.mkdirSync(embedded);
+    git(embedded, 'init', '-q');
+  });
+
+  afterEach(() => {
+    try { git(mainRepo, 'worktree', 'remove', '--force', worktree); } catch { /* best effort */ }
+    fs.rmSync(mainRepo, { recursive: true, force: true });
+  });
+
+  it.runIf(process.platform === 'win32')('still flags the borrowed index, keeping the caller\'s spelling', () => {
+    expect(mainRepo).toMatch(/^[A-Z]:\\/);
+    const lowerMain = lowerDrive(mainRepo);
+    const lowerWorktree = lowerDrive(worktree);
+    for (const [start, index] of [[lowerWorktree, lowerMain], [worktree, lowerMain], [lowerWorktree, mainRepo]]) {
+      const m = detectWorktreeIndexMismatch(start, index);
+      expect(m, `${start} on ${index}`).not.toBeNull();
+      expect(m!.indexRoot).toBe(real(index));
+    }
+  });
+
+  it.runIf(process.platform === 'win32')('is not a mismatch from the index root\'s own working tree', () => {
+    const lowerMain = lowerDrive(mainRepo);
+    expect(detectWorktreeIndexMismatch(lowerMain, mainRepo)).toBeNull();
+    expect(detectWorktreeIndexMismatch(mainRepo, lowerMain)).toBeNull();
+    expect(detectWorktreeIndexMismatch(path.join(lowerMain, 'src'), mainRepo)).toBeNull();
+  });
+
+  it.runIf(process.platform === 'win32')('is not a nested repository of its own; a different repository below still is', () => {
+    const lowerMain = lowerDrive(mainRepo);
+    const lowerWorktree = lowerDrive(worktree);
+    expect(nestedRepositoryBelow(lowerWorktree, lowerMain)).toBeNull();
+    expect(nestedRepositoryBelow(worktree, lowerMain)).toBeNull();
+    expect(nestedRepositoryBelow(lowerWorktree, mainRepo)).toBeNull();
+    expect(nestedRepositoryBelow(lowerDrive(embedded), lowerMain)?.relPath).toBe('embedded');
   });
 });
 
@@ -152,7 +240,7 @@ describe('worktree mismatch surfaces on hot read tools (issue #155)', () => {
     expect(res.isError).toBeFalsy();
     expect(text).toContain('different git worktree');
     expect(text).toContain(real(worktree));
-    expect(text).toContain('codegraph init');
+    expectAgentAdvice(text);
   });
 
   it('does NOT prefix when the default project is the main checkout itself', async () => {
@@ -167,6 +255,7 @@ describe('worktree mismatch surfaces on hot read tools (issue #155)', () => {
     const text = res.content[0].text;
     expect(text).toContain('different git working tree');
     expect(text).toContain(real(worktree));
+    expectAgentAdvice(text);
   });
 
   it('caches detection — a later tool call needs no further git spawn', async () => {
@@ -184,6 +273,178 @@ describe('worktree mismatch surfaces on hot read tools (issue #155)', () => {
       expect(second.content[0].text).toContain('different git worktree');
     } finally {
       process.env.PATH = savedPath;
+    }
+  });
+});
+
+/**
+ * A long-lived MCP server (the shared daemon) cached its worktree-mismatch
+ * verdict keyed only by the start path, and that cache was cleared only on
+ * shutdown. So once the server decided "this worktree borrows the main
+ * checkout's index" — true while the worktree had no `.codegraph/` of its own —
+ * the verdict was pinned for the daemon's whole life. After the worktree got
+ * its own index (the resolved index root flipped from the main checkout to the
+ * worktree itself), the CLI saw the worktree's index but the MCP server kept
+ * emitting the stale false warning until a restart (issue #926).
+ *
+ * The verdict depends on BOTH the start path and the resolved index root, so it
+ * must be cached under both — a changed index root has to invalidate it. This
+ * drives the real `ToolHandler` worktree-notice path across exactly that change
+ * (the resolved index root flips when the server's default project is re-opened
+ * onto the worktree's own index), with no mocking.
+ */
+describe('worktree mismatch verdict re-resolves when the index root changes (issue #926)', () => {
+  let mainRepo: string;
+  let worktree: string;
+  let mainCg: CodeGraph;
+  let worktreeCg: CodeGraph;
+  let handler: ToolHandler;
+
+  beforeEach(async () => {
+    mainRepo = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-wt-926-'));
+    git(mainRepo, 'init', '-q');
+    git(mainRepo, 'config', 'user.email', 'test@example.com');
+    git(mainRepo, 'config', 'user.name', 'Test');
+    git(mainRepo, 'config', 'commit.gpgsign', 'false');
+    fs.mkdirSync(path.join(mainRepo, 'src'));
+    fs.writeFileSync(path.join(mainRepo, 'src', 'a.ts'), 'export function mainOnly() { return 1; }\n');
+    git(mainRepo, 'add', '.');
+    git(mainRepo, 'commit', '-q', '-m', 'init');
+
+    // The long-lived server's default project starts as the MAIN checkout.
+    mainCg = CodeGraph.initSync(mainRepo);
+    await mainCg.indexAll();
+
+    // Nested worktree that later gains its own index.
+    worktree = path.join(mainRepo, 'wt');
+    git(mainRepo, 'worktree', 'add', '-q', '-b', 'feature', worktree);
+    worktreeCg = CodeGraph.initSync(worktree);
+    await worktreeCg.indexAll();
+
+    handler = new ToolHandler(mainCg);
+  });
+
+  afterEach(() => {
+    try { mainCg.destroy(); } catch { /* best effort */ }
+    try { worktreeCg.destroy(); } catch { /* best effort */ }
+    try { git(mainRepo, 'worktree', 'remove', '--force', worktree); } catch { /* best effort */ }
+    fs.rmSync(mainRepo, { recursive: true, force: true });
+  });
+
+  it('drops the stale "borrowed the main index" warning once the index root flips to the worktree', async () => {
+    // The server runs from inside the worktree, default project = main checkout.
+    handler.setDefaultProjectHint(worktree);
+
+    // Phase 1: the index genuinely belongs to a different working tree (the main
+    // checkout) → warn, and cache that verdict.
+    const before = await handler.execute('codegraph_status', {});
+    expect(before.content[0].text).toContain('different git working tree');
+    expect(before.content[0].text).toContain(real(mainRepo));
+
+    // Phase 2: the worktree's own index is now the server's default project
+    // (engine re-open → setDefaultCodeGraph). The resolved index root for the
+    // SAME start path flipped to the worktree itself, so the verdict must be
+    // recomputed to "no mismatch" — not served stale from before.
+    handler.setDefaultCodeGraph(worktreeCg);
+
+    const after = await handler.execute('codegraph_status', {});
+    expect(after.content[0].text).not.toContain('different git working tree');
+  });
+});
+
+/**
+ * A nested repo (submodule / embedded clone) whose files the PARENT index
+ * already covers must NOT be flagged as a borrowed worktree: indexing a
+ * super-repo descends into its submodules and gitlinked clones, so a query run
+ * from inside one resolves up to the parent index — which genuinely contains
+ * that nested repo's symbols. The warning's premise is false there, and its
+ * "codegraph init" advice would fragment the unified index. (#1031, #1033)
+ */
+describe('detectWorktreeIndexMismatch — nested repos covered by the parent index (#1031, #1033)', () => {
+  let parent: string;     // super-repo that owns the .codegraph index
+  let subSource: string;  // separate repo used as the submodule source
+
+  beforeEach(() => {
+    parent = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-wt-parent-'));
+    subSource = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-wt-subsrc-'));
+    for (const r of [parent, subSource]) {
+      git(r, 'init', '-q');
+      git(r, 'config', 'user.email', 'test@example.com');
+      git(r, 'config', 'user.name', 'Test');
+      git(r, 'config', 'commit.gpgsign', 'false');
+    }
+    fs.writeFileSync(path.join(subSource, 'lib.ts'), 'export const x = 1;\n');
+    git(subSource, 'add', '.');
+    git(subSource, 'commit', '-q', '-m', 'sub');
+    fs.writeFileSync(path.join(parent, 'README.md'), '# parent\n');
+    git(parent, 'add', '.');
+    git(parent, 'commit', '-q', '-m', 'init');
+  });
+
+  afterEach(() => {
+    fs.rmSync(parent, { recursive: true, force: true });
+    fs.rmSync(subSource, { recursive: true, force: true });
+  });
+
+  function addSubmodule(name: string): string {
+    execFileSync(
+      'git',
+      ['-c', 'protocol.file.allow=always', 'submodule', 'add', '-q', subSource, name],
+      { cwd: parent, stdio: ['ignore', 'ignore', 'ignore'] },
+    );
+    git(parent, 'commit', '-q', '-m', 'add submodule');
+    return path.join(parent, name);
+  }
+
+  function addBareGitlink(name: string): string {
+    const dir = path.join(parent, name);
+    fs.mkdirSync(dir);
+    git(dir, 'init', '-q');
+    git(dir, 'config', 'user.email', 'test@example.com');
+    git(dir, 'config', 'user.name', 'Test');
+    git(dir, 'config', 'commit.gpgsign', 'false');
+    fs.writeFileSync(path.join(dir, 'tool.ts'), 'export const y = 2;\n');
+    git(dir, 'add', '.');
+    git(dir, 'commit', '-q', '-m', 'tool');
+    git(parent, 'add', name); // records a 160000 gitlink, no .gitmodules
+    git(parent, 'commit', '-q', '-m', 'gitlink');
+    return dir;
+  }
+
+  it('does NOT flag an active submodule covered by the parent index', () => {
+    const sub = addSubmodule('service-a');
+    // The submodule IS its own working-tree root (so the old logic flagged it)…
+    expect(gitWorktreeRoot(sub)).toBe(real(sub));
+    // …but the parent index covers it, so there must be no warning.
+    expect(detectWorktreeIndexMismatch(sub, parent)).toBeNull();
+    expect(detectWorktreeIndexMismatch(path.join(sub, 'src'), parent)).toBeNull();
+  });
+
+  it('does NOT flag a bare gitlink (embedded clone, no .gitmodules) covered by the parent index', () => {
+    const embedded = addBareGitlink('embedded');
+    expect(gitWorktreeRoot(embedded)).toBe(real(embedded));
+    expect(detectWorktreeIndexMismatch(embedded, parent)).toBeNull();
+  });
+
+  it('gitCommonDir differs for a nested repo vs the parent (the discriminator)', () => {
+    const sub = addSubmodule('service-a');
+    const subCommon = gitCommonDir(sub);
+    const parentCommon = gitCommonDir(parent);
+    expect(subCommon).not.toBeNull();
+    expect(parentCommon).not.toBeNull();
+    expect(subCommon).not.toBe(parentCommon); // different repository → suppress
+  });
+
+  it('still flags a genuine linked worktree (same repo, different branch)', () => {
+    // A real worktree shares the parent's git common dir, so it stays flagged —
+    // the suppression must not weaken the issue-#155 case.
+    const wt = path.join(parent, 'wt');
+    git(parent, 'worktree', 'add', '-q', '-b', 'feature', wt);
+    try {
+      expect(gitCommonDir(wt)).toBe(gitCommonDir(parent)); // SAME repository
+      expect(detectWorktreeIndexMismatch(wt, parent)).not.toBeNull();
+    } finally {
+      try { git(parent, 'worktree', 'remove', '--force', wt); } catch { /* best effort */ }
     }
   });
 });

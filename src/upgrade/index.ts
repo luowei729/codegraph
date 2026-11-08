@@ -8,8 +8,9 @@
  *     canonical installer script (single source of truth) so the download /
  *     version-resolution / PATH logic never drifts between first-install and
  *     upgrade.
- *   - **npm** — installed via `npm i -g @colbymchenry/codegraph`. Upgrading
- *     shells out to npm.
+ *   - **npm** — installed via `npm i -g @colbymchenry/codegraph`, or into a
+ *     project. Upgrading shells out to npm (for a project, in that project).
+ *     A pnpm, yarn or bun install is named, with that manager's command.
  *   - **npx** — ephemeral; nothing to upgrade (next `npx` fetches latest).
  *   - **source** — a git checkout running its own `dist/`; `git pull` + rebuild.
  *
@@ -17,22 +18,25 @@
  * vendored `node` binary and a `bin/codegraph` launcher next to its `lib/`, so
  * we can recognize it from the running file's path without a marker file.
  *
- * Windows wrinkle: a running `node.exe` is locked and can't be deleted, so the
- * bundle's `current\` dir can't be overwritten in place by the process doing
- * the upgrade. We therefore spawn a DETACHED helper that waits for this
- * process to exit (releasing the lock), then runs `install.ps1`. This is the
- * conventional Windows self-update dance (rustup/nvm-windows do the same).
+ * Windows wrinkle: a running `node.exe` and a loaded `.node` addon are locked —
+ * they can't be overwritten or deleted, by this process or by the MCP servers
+ * of open agent sessions. They CAN be renamed, so the Windows upgrade unpacks
+ * the new bundle next to `current\` and swaps it in file by file, renaming each
+ * replaced file aside and rolling every step back on failure (see
+ * `WINDOWS_SWAP_FUNCTION`, shared verbatim with `install.ps1`).
  */
 
 import * as fs from 'fs';
 import * as path from 'path';
 import * as https from 'https';
 import { spawnSync } from 'child_process';
+import { ansiColorsEnabled } from '../ui/color';
 
 export const REPO = 'colbymchenry/codegraph';
 export const NPM_PACKAGE = '@colbymchenry/codegraph';
 const RAW_BASE = `https://raw.githubusercontent.com/${REPO}/main`;
 export const INSTALL_SH_URL = `${RAW_BASE}/install.sh`;
+export const INSTALL_PS1_URL = `${RAW_BASE}/install.ps1`;
 
 // ---------------------------------------------------------------------------
 // Install-method detection (pure — fully unit-testable via injected probes)
@@ -40,8 +44,15 @@ export const INSTALL_SH_URL = `${RAW_BASE}/install.sh`;
 
 export type InstallMethod =
   | { kind: 'bundle'; os: 'unix' | 'windows'; bundleRoot: string; installDir: string | null }
-  | { kind: 'npm'; scope: 'global' | 'local' }
+  | {
+      kind: 'npm';
+      scope: 'global' | 'local';
+      /** Local only: the project folder whose node_modules holds this install, where npm runs. */
+      root?: string;
+    }
   | { kind: 'npx' }
+  /** Installed by another package manager, which has to upgrade it (npm can't). */
+  | { kind: 'package-manager'; manager: 'pnpm' | 'yarn' | 'bun'; global: boolean }
   | { kind: 'source'; root: string }
   | { kind: 'unknown'; reason: string };
 
@@ -49,7 +60,11 @@ export interface DetectInput {
   /** `__filename` of the running CLI module — `<…>/dist/bin/codegraph.js`. */
   filename: string;
   platform: NodeJS.Platform;
-  cwd: string;
+  /**
+   * The folder `upgrade` runs from. Detection doesn't read it: where an
+   * install lives says how it was installed, from any folder (#2477).
+   */
+  cwd?: string;
   /** Injectable existence probe (defaults to fs.existsSync) — for tests. */
   exists?: (p: string) => boolean;
 }
@@ -99,6 +114,51 @@ export function detectInstallMethod(input: DetectInput): InstallMethod {
   const P = isWin ? path.win32 : path.posix;
   const binDir = P.dirname(input.filename); // <…>/bin
 
+  const norm = toPosix(input.filename);
+
+  // Path-based checks come FIRST. The npm thin-installer's per-platform
+  // package (@colbymchenry/codegraph-<platform>-<arch>) is itself a complete
+  // bundle — vendored node + bin/ launcher — living inside node_modules, so
+  // the layout sniff below would misread every npm install as a standalone
+  // bundle. `upgrade` would then curl install.sh into ~/.codegraph: a SECOND
+  // install that never wins the PATH race against npm's shim, leaving
+  // `codegraph -v` permanently on the old version (the #1071 shadow,
+  // self-inflicted). A path under node_modules is authoritative about HOW the
+  // user installed, whatever the artifact inside looks like.
+
+  // npx cache: <…>/_npx/<hash>/node_modules/@colbymchenry/codegraph/…
+  // (checked before npm — the npx cache path also contains /node_modules/).
+  if (norm.includes('/_npx/')) {
+    return { kind: 'npx' };
+  }
+
+  // npm install (global or local): lives under a node_modules tree. Which of
+  // the two is read from npm's own layout, never from cwd (#2477). A global
+  // prefix often sits inside the home folder — Windows `%APPDATA%\npm`, nvm,
+  // fnm, `~/.npm-global` — so "the running file is under cwd" took every such
+  // global install for a local one whenever `upgrade` ran from home: `npm
+  // install` without -g left the global copy stale and dropped a stray local
+  // one into the home folder.
+  const nodeModulesAt = norm.indexOf('/node_modules/');
+  if (nodeModulesAt !== -1) {
+    // The folder holding the outermost node_modules (the same offset in
+    // `filename`, which `toPosix` only changes slash by slash): the global
+    // prefix on Windows, `<prefix>/lib` on POSIX, or the project root.
+    let owner = input.filename.slice(0, nodeModulesAt);
+    if (owner === '' || /^[A-Za-z]:$/.test(owner)) owner += P.sep; // a tree at a filesystem/drive root
+    // pnpm, yarn and bun keep their global packages in a folder that looks
+    // like an npm project (a package.json beside node_modules); running npm
+    // there, or a second copy through npm, is never the upgrade.
+    const manager = otherPackageManager(norm, owner, P, exists);
+    if (manager) return manager;
+    if (isNpmGlobalTree(owner, P, isWin, exists)) return { kind: 'npm', scope: 'global' };
+    // A project's install is upgraded in that project, whatever folder
+    // `upgrade` runs from: npm run anywhere else — outside the project, or in
+    // another project inside it, as in a home folder that is itself one —
+    // installs a second copy there and leaves this one as it was.
+    return { kind: 'npm', scope: 'local', root: P.resolve(owner) };
+  }
+
   // Bundle: <root>/lib/dist/bin/codegraph.js → <root> is up 3 from bin/.
   // A bundle has a vendored node + a launcher script as siblings of lib/.
   const bundleRoot = P.resolve(binDir, '..', '..', '..');
@@ -109,19 +169,6 @@ export function detectInstallMethod(input: DetectInput): InstallMethod {
     return { kind: 'bundle', os, bundleRoot, installDir: deriveInstallDir(bundleRoot, os, exists) };
   }
 
-  const norm = toPosix(input.filename);
-
-  // npx cache: <…>/_npx/<hash>/node_modules/@colbymchenry/codegraph/…
-  if (norm.includes('/_npx/')) {
-    return { kind: 'npx' };
-  }
-
-  // npm install (global or local): lives under a node_modules tree.
-  if (norm.includes('/node_modules/')) {
-    const underCwd = norm.startsWith(toPosix(P.resolve(input.cwd)) + '/');
-    return { kind: 'npm', scope: underCwd ? 'local' : 'global' };
-  }
-
   // Source checkout: running <repo>/dist/bin/codegraph.js with a sibling .git.
   const repoRoot = P.resolve(binDir, '..', '..');
   if (exists(P.join(repoRoot, 'package.json')) && exists(P.join(repoRoot, '.git'))) {
@@ -129,6 +176,50 @@ export function detectInstallMethod(input: DetectInput): InstallMethod {
   }
 
   return { kind: 'unknown', reason: `unrecognized install layout at ${input.filename}` };
+}
+
+/** A pnpm, yarn or bun install, from its `.pnpm` layout or its lockfile beside node_modules. */
+function otherPackageManager(
+  norm: string,
+  owner: string,
+  P: path.PlatformPath,
+  exists: (p: string) => boolean,
+): Extract<InstallMethod, { kind: 'package-manager' }> | null {
+  const where = toPosix(owner).toLowerCase();
+  if (norm.includes('/node_modules/.pnpm/') || exists(P.join(owner, 'pnpm-lock.yaml'))) {
+    return { kind: 'package-manager', manager: 'pnpm', global: /\/pnpm\/global\//.test(where + '/') };
+  }
+  if (exists(P.join(owner, 'yarn.lock'))) {
+    return { kind: 'package-manager', manager: 'yarn', global: /\/yarn\/(?:data\/)?global$/.test(where) };
+  }
+  if (exists(P.join(owner, 'bun.lockb')) || exists(P.join(owner, 'bun.lock'))) {
+    return { kind: 'package-manager', manager: 'bun', global: /\/\.bun\/install\/global$/.test(where) };
+  }
+  return null;
+}
+
+/**
+ * Whether the node_modules tree in `owner` is npm's global one, read from
+ * where npm put the launcher: beside a global tree — `<prefix>\codegraph.cmd`
+ * on Windows, `<prefix>/bin/codegraph` next to `<prefix>/lib/node_modules` on
+ * POSIX — and in `node_modules/.bin` of a project folder (one with a
+ * package.json) for a local install. A tree with neither is taken for
+ * global, since no project owns it.
+ */
+function isNpmGlobalTree(
+  owner: string,
+  P: path.PlatformPath,
+  isWin: boolean,
+  exists: (p: string) => boolean,
+): boolean {
+  const globalLauncher = isWin
+    ? exists(P.join(owner, 'codegraph.cmd'))
+    : P.basename(owner) === 'lib' && exists(P.join(P.dirname(owner), 'bin', 'codegraph'));
+  if (globalLauncher) return true;
+  const bin = P.join(owner, 'node_modules', '.bin');
+  const local = exists(P.join(bin, 'codegraph')) || exists(P.join(bin, 'codegraph.cmd'))
+    || exists(P.join(owner, 'package.json'));
+  return !local;
 }
 
 // ---------------------------------------------------------------------------
@@ -277,29 +368,48 @@ export interface UpgradeDeps {
   method: InstallMethod;
   resolveLatest: (pin?: string) => Promise<string>;
   /** Run a command inheriting stdio; returns its exit code (-1 = spawn failed). */
-  run: (cmd: string, args: string[], env?: NodeJS.ProcessEnv) => number;
+  run: (cmd: string, args: string[], env?: NodeJS.ProcessEnv, cwd?: string) => number;
+  /** Run a command capturing stdout (nothing reaches the terminal); null = spawn failed. */
+  capture: (cmd: string, args: string[]) => { code: number; stdout: string } | null;
   hasCommand: (cmd: string) => boolean;
   log: (msg: string) => void;
   warn: (msg: string) => void;
   error: (msg: string) => void;
   platform: NodeJS.Platform;
+  /**
+   * Wire Claude Code's front-load prompt hook into the GLOBAL Claude profile
+   * when that profile already has CodeGraph configured; resolves true when it
+   * changed the settings file. That file is the user's real
+   * `~/.claude/settings.json`, so the writer is injected like every other side
+   * effect here — the CLI passes {@link defaultWirePromptHook}, unit tests a
+   * recorder (#2275: tests that reached the real one rewrote the developer's).
+   */
+  wirePromptHook: () => Promise<boolean>;
+  /**
+   * Offer the one-time CodeGraph Pro beta opt-in after a successful update
+   * (see installer/beta-signup — self-gating: TTY only, and silent forever
+   * once any install/upgrade ask was answered). Optional so unit tests and
+   * embedded callers stay prompt-free; never fatal to the upgrade.
+   */
+  offerBetaSignup?: () => Promise<void>;
 }
 
+// Colors off when piped / NO_COLOR / --no-color (#1281).
+const useColor = ansiColorsEnabled();
 const c = {
-  bold: (s: string) => `\x1b[1m${s}\x1b[0m`,
-  dim: (s: string) => `\x1b[2m${s}\x1b[0m`,
-  green: (s: string) => `\x1b[32m${s}\x1b[0m`,
-  yellow: (s: string) => `\x1b[33m${s}\x1b[0m`,
-  cyan: (s: string) => `\x1b[36m${s}\x1b[0m`,
+  bold: (s: string) => (useColor ? `\x1b[1m${s}\x1b[0m` : s),
+  dim: (s: string) => (useColor ? `\x1b[2m${s}\x1b[0m` : s),
+  green: (s: string) => (useColor ? `\x1b[32m${s}\x1b[0m` : s),
+  yellow: (s: string) => (useColor ? `\x1b[33m${s}\x1b[0m` : s),
+  cyan: (s: string) => (useColor ? `\x1b[36m${s}\x1b[0m` : s),
 };
 
 /** The honest, additive re-index reminder shown after a successful upgrade. */
 export function reindexAdvisory(): string {
   return [
     c.dim('Your existing project indexes keep working, but were built by the previous version.'),
-    c.dim('To pick up this version’s extraction improvements, refresh each project:'),
-    `  ${c.cyan('codegraph sync')}        ${c.dim('# incremental, fast')}`,
-    `  ${c.cyan('codegraph index -f')}    ${c.dim('# full rebuild')}`,
+    c.dim('To pick up this version’s extraction improvements, rebuild each project:'),
+    `  ${c.cyan('codegraph index')}    ${c.dim('# full rebuild')}`,
     c.dim('(`codegraph status` flags any index that predates the engine you’re running.)'),
   ].join('\n');
 }
@@ -340,20 +450,36 @@ export async function runUpgrade(opts: UpgradeOptions, deps: UpgradeDeps): Promi
     return 0;
   }
 
-  // Dispatch by install method.
+  // Dispatch by install method. bundle/npm perform a real binary update, so
+  // after they succeed we self-heal the front-load hook (below); npx/source/
+  // unknown don't update anything here, so they return directly.
+  let code: number;
   switch (method.kind) {
     case 'bundle':
-      return method.os === 'windows'
+      code = await (method.os === 'windows'
         ? upgradeWindowsBundle(method, latest, deps)
-        : upgradeUnixBundle(method, opts.version ? latest : undefined, deps);
+        : upgradeUnixBundle(method, opts.version ? latest : undefined, deps));
+      break;
     case 'npm':
       // npm version specs have no leading "v" (`@0.9.8`, not `@v0.9.8` — the
       // latter resolves as a nonexistent dist-tag).
-      return upgradeNpm(method, opts.version ? stripV(latest) : 'latest', deps);
+      code = await upgradeNpm(method, opts.version ? stripV(latest) : 'latest', deps);
+      break;
     case 'npx':
       deps.log(c.green('npx always runs the latest version on demand — nothing to upgrade.'));
       deps.log(c.dim(`Force a fresh fetch with: npx ${NPM_PACKAGE}@latest`));
       return 0;
+    case 'package-manager': {
+      const pkg = `${NPM_PACKAGE}@${opts.version ? stripV(latest) : 'latest'}`;
+      const command = {
+        pnpm: method.global ? `pnpm add -g ${pkg}` : `pnpm add ${pkg}`,
+        yarn: method.global ? `yarn global add ${pkg}` : `yarn add ${pkg}`,
+        bun: method.global ? `bun add -g ${pkg}` : `bun add ${pkg}`,
+      }[method.manager];
+      deps.warn(`This CodeGraph was installed with ${method.manager}, so npm can't upgrade it.`);
+      deps.log(c.dim(`Upgrade it with:  ${command}`));
+      return 1;
+    }
     case 'source':
       deps.warn(`Running from a source checkout at ${method.root}.`);
       deps.log(c.dim('Upgrade it with: git pull && npm run build'));
@@ -362,6 +488,158 @@ export async function runUpgrade(opts: UpgradeOptions, deps: UpgradeDeps): Promi
       deps.error(`Couldn’t determine how CodeGraph was installed (${method.reason}).`);
       deps.log(c.dim(`Reinstall manually — see https://github.com/${REPO}#install`));
       return 1;
+  }
+
+  // After a successful update, ensure the front-load prompt hook is wired for an
+  // already-configured global Claude install — so existing users pick it up on
+  // upgrade, not only on a fresh `install` (the hook config is version-agnostic,
+  // so the still-running old binary can write it safely). Idempotent + gated on
+  // an existing Claude config, and skipped entirely by the kill-switch. Never
+  // fatal to the upgrade.
+  if (code === 0) {
+    let probe: VersionProbe = 'inconclusive';
+    try {
+      probe = reportResolvedVersion(latest, deps);
+    } catch {
+      /* an inconclusive probe must not fail the upgrade */
+    }
+    try {
+      await selfHealPromptHook(deps);
+    } catch {
+      /* a hook-wiring hiccup must not fail the upgrade */
+    }
+    // The refresh executes whatever `codegraph` PATH resolves. If the probe
+    // just proved that's a stale shadowed install, spawning it would rewrite
+    // the agent surfaces with the very templates the refresh exists to heal —
+    // skip, and point at the manual command for after the PATH is fixed.
+    if (probe !== 'mismatch') {
+      try {
+        selfHealInstalledSurfaces(deps);
+      } catch {
+        /* a refresh hiccup must not fail the upgrade */
+      }
+    } else {
+      deps.log(c.dim('Skipped refreshing agent instructions/config — run `codegraph install --refresh` once the PATH is fixed.'));
+    }
+    // Reached only after a real binary update (check/up-to-date/npx/source
+    // all returned earlier) — the one place the upgrade path may offer the
+    // beta opt-in. The hook self-gates on TTY + the stored once-per-machine
+    // choice, so an already-answered user never sees it again.
+    try {
+      await deps.offerBetaSignup?.();
+    } catch {
+      /* a marketing question must never fail the upgrade */
+    }
+  }
+  return code;
+}
+
+type VersionProbe = 'match' | 'mismatch' | 'inconclusive';
+
+/**
+ * Prove the upgrade actually took: spawn the `codegraph` this terminal's PATH
+ * resolves and compare its reported version to the target. Catches the silent
+ * failure mode where ANOTHER install shadows the one we just upgraded (issue
+ * #1071 — e.g. a stale `npm i -g` copy earlier on PATH than the bundle
+ * launcher): the upgrade "succeeds" but `codegraph -v` — in this terminal and
+ * every future one — keeps serving the old version. Exported for unit tests.
+ */
+export function verifyResolvedVersion(latest: string, deps: UpgradeDeps): VersionProbe {
+  if (!deps.hasCommand('codegraph')) return 'inconclusive';
+  // Windows installs expose codegraph through a .cmd launcher; Node can't
+  // spawn .cmd files without a shell, so route through cmd.exe there.
+  const probe = deps.platform === 'win32'
+    ? deps.capture('cmd.exe', ['/d', '/s', '/c', 'codegraph --version'])
+    : deps.capture('codegraph', ['--version']);
+  if (!probe || probe.code !== 0) return 'inconclusive';
+  // `codegraph --version` prints the bare version; take the last non-empty
+  // line so a stray runtime warning above it can't spoil the parse.
+  const reported = probe.stdout.trim().split(/\r?\n/).pop()?.trim() ?? '';
+  if (!parseSemver(reported)) return 'inconclusive';
+  return compareVersions(reported, latest) === 0 ? 'match' : 'mismatch';
+}
+
+/**
+ * Log the outcome of the post-upgrade version probe. On a match the user
+ * knows the current terminal is already serving the new version; on a
+ * mismatch they get told exactly which stale install is hijacking their PATH
+ * instead of discovering it via a mysteriously unchanged `codegraph -v`.
+ * Inconclusive probes fall back to the old soft hint — never a scare on
+ * setups we can't inspect (no `codegraph` on PATH yet, exotic wrappers).
+ * Returns the probe result so the caller can gate the post-upgrade refresh
+ * (which spawns the PATH-resolved binary) on it.
+ */
+function reportResolvedVersion(latest: string, deps: UpgradeDeps): VersionProbe {
+  const { method } = deps;
+  // A project-local npm install isn't served by PATH's `codegraph` (that
+  // would be some other install) — a probe could only false-alarm. Read the
+  // version npm left in the project instead, so a no-op install isn't
+  // reported as an upgrade (#2477).
+  if (method.kind === 'npm' && method.scope === 'local') {
+    const installed = method.root ? readInstalledVersion(method.root) : null;
+    if (installed && parseSemver(installed) && compareVersions(installed, latest) === 0) {
+      deps.log(c.green(`✓ ${method.root} now has CodeGraph ${latest}.`));
+    } else if (installed) {
+      deps.warn(`npm finished, but ${method.root} still has CodeGraph ${normalizeVersion(installed)}.`);
+    }
+    return 'inconclusive';
+  }
+  const probe = verifyResolvedVersion(latest, deps);
+  switch (probe) {
+    case 'match':
+      deps.log(c.green(`✓ \`codegraph\` on your PATH now reports ${latest} — this terminal is already using it.`));
+      break;
+    case 'mismatch':
+      deps.warn(`Installed ${latest}, but the \`codegraph\` this terminal resolves still reports an older version.`);
+      deps.log(c.dim('Another CodeGraph install earlier on your PATH is shadowing the one just upgraded.'));
+      deps.log(c.dim('Find every copy with `which -a codegraph` (Windows: `where codegraph`) and remove or upgrade the stale one.'));
+      break;
+    case 'inconclusive':
+      deps.log(c.dim('Open a new terminal if `codegraph --version` looks unchanged (PATH cache).'));
+      break;
+  }
+  return probe;
+}
+
+/**
+ * Refresh the agent surfaces previous installs wrote — the marker-fenced
+ * instructions sections (CLAUDE.md / AGENTS.md / GEMINI.md), MCP entries,
+ * legacy-hook cleanups — so they match the version that will serve them.
+ * Unlike the prompt hook above, this content is NOT version-agnostic: the
+ * templates are baked into the binary, so the still-running old process
+ * would only rewrite its own stale copy — the exact staleness this heals.
+ * We therefore spawn the freshly-installed binary (`codegraph install
+ * --refresh`), which is refresh-only: agents never configured stay
+ * untouched, and permission / prompt-hook choices are preserved. Gated on
+ * `codegraph` being resolvable on PATH (an npm-local install isn't) and on
+ * the kill-switch; never fatal to the upgrade.
+ */
+function selfHealInstalledSurfaces(deps: UpgradeDeps): void {
+  if (process.env.CODEGRAPH_NO_INSTALL_REFRESH === '1') return;
+  if (!deps.hasCommand('codegraph')) return;
+  deps.log(c.dim('Refreshing agent instruction sections and config written by previous versions…'));
+  // Windows installs expose codegraph through a .cmd launcher. Node cannot
+  // spawn .cmd files directly without a shell, so route the constant command
+  // through cmd.exe there (the same launcher a terminal would resolve).
+  const code = deps.platform === 'win32'
+    ? deps.run('cmd.exe', ['/d', '/s', '/c', 'codegraph install --refresh'])
+    : deps.run('codegraph', ['install', '--refresh']);
+  if (code !== 0) {
+    deps.warn('Could not refresh the installed agent surfaces — run `codegraph install --refresh` manually.');
+  }
+}
+
+/**
+ * Wire the Claude `UserPromptSubmit` front-load hook on upgrade for an
+ * already-configured global Claude install. No-op when Claude isn't configured,
+ * when the hook is already present, or when the kill-switch is set.
+ */
+async function selfHealPromptHook(deps: UpgradeDeps): Promise<void> {
+  if (process.env.CODEGRAPH_NO_PROMPT_HOOK === '1' || process.env.CODEGRAPH_PROMPT_HOOK === '0') return;
+  if (await deps.wirePromptHook()) {
+    deps.log(
+      c.dim('Enabled the CodeGraph front-load hook for Claude Code (structural prompts). Disable any time: CODEGRAPH_NO_PROMPT_HOOK=1'),
+    );
   }
 }
 
@@ -392,41 +670,147 @@ function upgradeUnixBundle(
     return 1;
   }
   deps.log('');
-  deps.log(c.green('✓ Upgrade complete.') + c.dim(' Open a new terminal if the version looks unchanged (PATH cache).'));
+  // No "open a new terminal" hedge here — after the swap, runUpgrade probes
+  // the PATH-resolved `codegraph --version` and reports the real outcome.
+  deps.log(c.green('✓ Upgrade complete.'));
   deps.log(reindexAdvisory());
   return 0;
 }
+
+/**
+ * The PowerShell function that moves an unpacked Windows bundle into the
+ * install's `current\` dir. Shared VERBATIM with `install.ps1` (a test pins the
+ * two copies equal), so a first install, a re-run of the installer, and
+ * `codegraph upgrade` all replace files the same way.
+ *
+ * Why file-by-file renames (#2185): every open agent session runs a CodeGraph
+ * MCP server from `current\`, which keeps `node.exe` and the native kernel
+ * (`lib\kernel\codegraph-kernel.node`) locked. Windows refuses to overwrite or
+ * delete a running exe or a loaded DLL but does let it be renamed. The old
+ * upgrade renamed only `node.exe` and then `Copy-Item`ed over the rest, so the
+ * locked kernel failed the copy halfway — leaving no `node.exe` and a mix of
+ * versions, which no `codegraph` command could repair. Now each file being
+ * replaced (or dropped by the new version) is renamed aside to
+ * `<name>.old-<token>` before the staged file is moved in; any failure undoes
+ * every step, and the renamed-aside files are deleted on the next successful
+ * run once nothing holds them.
+ */
+export const WINDOWS_SWAP_FUNCTION = String.raw`function Install-CodeGraphFiles([string]$Stage, [string]$Dest) {
+  # Move an unpacked bundle into $Dest. Windows can't overwrite or delete a
+  # running node.exe or a loaded .node addon, but it can rename one, so every
+  # file being replaced (or dropped by the new version) is first renamed aside
+  # to <name>.old-<token>. Any failure puts every file back, so the install is
+  # never left half-replaced or without its node.exe.
+  $ErrorActionPreference = 'Stop'
+  $stageDir = (Resolve-Path -LiteralPath $Stage).ProviderPath.TrimEnd('\')
+  foreach ($need in 'node.exe', 'bin\codegraph.cmd') {
+    if (-not (Test-Path -LiteralPath (Join-Path $stageDir $need))) { throw "The CodeGraph download is incomplete (no $need); nothing was changed." }
+  }
+  $token = [guid]::NewGuid().ToString('N').Substring(0, 8)
+  $asideName = '\.old-[0-9a-f]{8,32}$'
+  $files = @{}; $dirs = @{}
+  foreach ($i in @(Get-ChildItem -LiteralPath $stageDir -Recurse -Force)) {
+    $rel = $i.FullName.Substring($stageDir.Length)
+    if ($i.PSIsContainer) { $dirs[$rel] = $true } else { $files[$rel] = $true }
+  }
+  $undo = New-Object System.Collections.ArrayList
+  function Move-Logged([string]$From, [string]$To) { [IO.File]::Move($From, $To); [void]$undo.Add(@($From, $To)) }
+  function Undo-Logged {
+    $lost = 0
+    for ($n = $undo.Count - 1; $n -ge 0; $n--) {
+      $u = $undo[$n]
+      try { if ($u.Count -eq 2) { [IO.File]::Move($u[1], $u[0]) } else { [IO.Directory]::Delete($u[0]) } } catch { if ($u.Count -eq 2) { $lost++ } }
+    }
+    $undo.Clear()
+    $lost
+  }
+  $done = $false; $at = $Dest
+  try {
+    if (-not (Test-Path -LiteralPath $Dest)) { [void][IO.Directory]::CreateDirectory($Dest); [void]$undo.Add(@($Dest)) }
+    $destDir = (Resolve-Path -LiteralPath $Dest).ProviderPath.TrimEnd('\')
+    foreach ($f in @(Get-ChildItem -LiteralPath $destDir -Recurse -Force -File)) {
+      if (-not $files.ContainsKey($f.FullName.Substring($destDir.Length)) -and $f.Name -notmatch $asideName) {
+        $at = $f.FullName; Move-Logged $at "$at.old-$token"
+      }
+    }
+    foreach ($rel in @($dirs.Keys | Sort-Object Length)) {
+      $at = $destDir + $rel
+      if (-not [IO.Directory]::Exists($at)) { [void][IO.Directory]::CreateDirectory($at); [void]$undo.Add(@($at)) }
+    }
+    foreach ($rel in @($files.Keys)) {
+      $at = $destDir + $rel
+      if ([IO.File]::Exists($at)) { Move-Logged $at "$at.old-$token" }
+      Move-Logged ($stageDir + $rel) $at
+    }
+    $done = $true
+  } catch {
+    $x = $_.Exception; while ($x.InnerException) { $x = $x.InnerException }
+    $lost = Undo-Logged
+    $msg = "Could not replace $at ($($x.Message))."
+    if ($lost) {
+      $msg += " $lost file(s) could not be put back, so the install may not start. Close your agent sessions and any running codegraph commands, then reinstall: irm https://raw.githubusercontent.com/colbymchenry/codegraph/main/install.ps1 | iex"
+    } else {
+      $msg += " Nothing was changed: the existing install still works. If another program has CodeGraph's files open, close your agent sessions (they run the CodeGraph MCP server) and any running codegraph commands, then try again."
+    }
+    $e = New-Object System.Exception($msg); $e.Data['codegraphDamaged'] = [bool]$lost; throw $e
+  } finally {
+    # Interrupted (Ctrl+C) without reaching catch: still put everything back.
+    if (-not $done) { [void](Undo-Logged) }
+  }
+  # Delete what this run and earlier ones renamed aside. A file a running
+  # process still holds can't be deleted yet; the next install retries it.
+  foreach ($f in @(Get-ChildItem -LiteralPath $destDir -Recurse -Force -File -ErrorAction SilentlyContinue)) {
+    if ($f.Name -match $asideName) { try { [IO.File]::Delete($f.FullName) } catch {} }
+  }
+  foreach ($d in @(Get-ChildItem -LiteralPath $destDir -Recurse -Force -Directory -ErrorAction SilentlyContinue | Sort-Object { $_.FullName.Length } -Descending)) {
+    if (-not $dirs.ContainsKey($d.FullName.Substring($destDir.Length))) { try { [IO.Directory]::Delete($d.FullName) } catch {} }
+  }
+}
+`;
+
+/** Single-quote a value for PowerShell (a `'` inside is doubled). */
+function psQuote(value: string): string {
+  return `'${value.replace(/'/g, "''")}'`;
+}
+
+/** Exit code of the upgrade script when files could not all be put back. */
+export const WINDOWS_UPGRADE_DAMAGED = 2;
 
 /** Build the in-place Windows upgrade script (exported for unit-testing). */
 export function buildWindowsUpgradeScript(bundleRoot: string, version: string, arch: string): string {
   const target = `win32-${arch}`;
   const url = `https://github.com/${REPO}/releases/download/${version}/codegraph-${target}.zip`;
-  // Windows can't DELETE a running exe but CAN rename it, so we upgrade IN
-  // PLACE: download → rename the locked node.exe aside → extract the new bundle
-  // over current\. Synchronous, no detached helper (which dies under SSH/job
-  // objects and has worse UX). The running process keeps its renamed node.exe
-  // mapped; the NEXT `codegraph` invocation uses the new one. We can't reuse
-  // install.ps1 here — it `Remove-Item`s current\, which fails on the locked exe.
+  // Synchronous, no detached helper (which dies under SSH/job objects and has
+  // worse UX). The bundle is unpacked into a sibling of current\ — the same
+  // volume, so the swap is renames, never a half-finished copy — and nothing
+  // in current\ changes until it is fully unpacked. The running process keeps
+  // its renamed node.exe mapped; the NEXT `codegraph` invocation uses the new
+  // one. Exit codes: 0 installed, 1 failed with the install unchanged,
+  // WINDOWS_UPGRADE_DAMAGED when the rollback could not restore every file.
   return [
     `$ErrorActionPreference='Stop'`,
-    `$dest='${bundleRoot}'`,
-    `$url='${url}'`,
-    `Write-Host "Downloading $url"`,
+    WINDOWS_SWAP_FUNCTION,
+    `$dest=${psQuote(bundleRoot)}`,
+    `$url=${psQuote(url)}`,
     `$tmp=Join-Path $env:TEMP ('cg-up-'+[guid]::NewGuid().ToString('N'))`,
-    `New-Item -ItemType Directory -Force -Path $tmp | Out-Null`,
-    `$zip=Join-Path $tmp 'cg.zip'`,
-    `Invoke-WebRequest -Uri $url -OutFile $zip`,
-    `$stage=Join-Path $tmp 'stage'`,
-    `Expand-Archive -Path $zip -DestinationPath $stage -Force`,
-    `$inner=Join-Path $stage 'codegraph-${target}'`,
-    `$src=if(Test-Path $inner){$inner}else{$stage}`,
-    `$node=Join-Path $dest 'node.exe'`,
-    `if(Test-Path $node){Rename-Item -Path $node -NewName ('node.exe.old-'+[guid]::NewGuid().ToString('N')) -Force}`,
-    `Copy-Item -Path (Join-Path $src '*') -Destination $dest -Recurse -Force`,
-    `Get-ChildItem -Path $dest -Filter 'node.exe.old-*' -ErrorAction SilentlyContinue | ForEach-Object { try { Remove-Item $_.FullName -Force -ErrorAction Stop } catch {} }`,
-    `Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue`,
-    `Write-Host "Installed CodeGraph ${version} to $dest"`,
-  ].join(';');
+    `$stage=Join-Path (Split-Path -Parent $dest) ('.staging-'+[guid]::NewGuid().ToString('N').Substring(0,8))`,
+    `$code=0`,
+    `try {`,
+    `  Write-Host "Downloading $url"`,
+    `  New-Item -ItemType Directory -Force -Path $tmp | Out-Null`,
+    `  $zip=Join-Path $tmp 'cg.zip'`,
+    `  Invoke-WebRequest -Uri $url -OutFile $zip`,
+    `  Expand-Archive -Path $zip -DestinationPath $stage -Force`,
+    `  $inner=Join-Path $stage 'codegraph-${target}'`,
+    `  Install-CodeGraphFiles $(if(Test-Path $inner){$inner}else{$stage}) $dest`,
+    `  Write-Host "Installed CodeGraph ${version} to $dest"`,
+    `} catch {`,
+    `  [Console]::Error.WriteLine($_.Exception.Message)`,
+    `  $code=if($_.Exception.Data['codegraphDamaged']){${WINDOWS_UPGRADE_DAMAGED}}else{1}`,
+    `}`,
+    `Remove-Item -LiteralPath $stage,$tmp -Recurse -Force -ErrorAction SilentlyContinue`,
+    `exit $code`,
+  ].join('\n');
 }
 
 function upgradeWindowsBundle(
@@ -443,13 +827,38 @@ function upgradeWindowsBundle(
   deps.log(c.dim(`Downloading and installing ${latest}…`));
   const code = deps.run('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', encoded]);
   if (code !== 0) {
-    deps.error(`Installer exited with code ${code}.`);
+    // The script has already printed what went wrong and what to do.
+    if (code === WINDOWS_UPGRADE_DAMAGED) {
+      deps.error('The upgrade failed and some files could not be put back.');
+      deps.log(c.dim(`Close your agent sessions and any running codegraph commands, then reinstall:  irm ${INSTALL_PS1_URL} | iex`));
+    } else if (code === 1) {
+      deps.error(`The upgrade to ${latest} did not complete; your existing install was left as it was.`);
+    } else {
+      deps.error(`Installer exited with code ${code}.`);
+    }
     return 1;
   }
   deps.log('');
-  deps.log(c.green('✓ Upgrade complete.') + c.dim(' Open a new terminal to be safe (PATH/version cache).'));
+  // The running node.exe was renamed aside, so the version probe in
+  // runUpgrade already exercises the NEW binary — no terminal hedge needed.
+  deps.log(c.green('✓ Upgrade complete.'));
   deps.log(reindexAdvisory());
   return 0;
+}
+
+/**
+ * How to invoke npm. On Windows npm is a .cmd batch file, which Node refuses
+ * to spawn without a shell (EINVAL since the CVE-2024-27980 hardening) — a
+ * direct `npm.cmd` spawn fails on every current Node, so route it through
+ * cmd.exe, the same way the surface-refresh step invokes the .cmd launcher.
+ * (Verified live on the Windows VM: `spawnSync('npm.cmd')` → EINVAL;
+ * `cmd.exe /d /s /c npm …` → works.)
+ */
+export function npmInvocation(platform: NodeJS.Platform, npmArgs: string[]): { cmd: string; args: string[] } {
+  if (platform === 'win32') {
+    return { cmd: 'cmd.exe', args: ['/d', '/s', '/c', ['npm', ...npmArgs].join(' ')] };
+  }
+  return { cmd: 'npm', args: npmArgs };
 }
 
 function upgradeNpm(
@@ -457,12 +866,15 @@ function upgradeNpm(
   versionSpec: string,
   deps: UpgradeDeps
 ): number {
-  const npm = deps.platform === 'win32' ? 'npm.cmd' : 'npm';
   const args = method.scope === 'global'
     ? ['install', '-g', `${NPM_PACKAGE}@${versionSpec}`]
     : ['install', `${NPM_PACKAGE}@${versionSpec}`];
-  deps.log(c.dim(`Running: ${npm} ${args.join(' ')}`));
-  const code = deps.run(npm, args, process.env);
+  // A local install is upgraded in the project it belongs to: npm run from
+  // any other folder would install a second, stray copy there.
+  const where = method.scope === 'local' ? method.root : undefined;
+  deps.log(c.dim(`Running: npm ${args.join(' ')}${where ? ` (in ${where})` : ''}`));
+  const inv = npmInvocation(deps.platform, args);
+  const code = deps.run(inv.cmd, inv.args, process.env, where);
   if (code !== 0) {
     deps.error(`npm exited with code ${code}.`);
     if (method.scope === 'global') {
@@ -508,8 +920,40 @@ export function hasCommand(cmd: string): boolean {
   return false;
 }
 
-export function defaultRun(cmd: string, args: string[], env?: NodeJS.ProcessEnv): number {
-  const r = spawnSync(cmd, args, { stdio: 'inherit', env: env ?? process.env });
+export function defaultRun(cmd: string, args: string[], env?: NodeJS.ProcessEnv, cwd?: string): number {
+  const r = spawnSync(cmd, args, { stdio: 'inherit', env: env ?? process.env, windowsHide: true, cwd });
   if (r.error) return -1;
   return r.status ?? -1;
+}
+
+/** The CodeGraph version installed in `root/node_modules`, or null. */
+function readInstalledVersion(root: string): string | null {
+  try {
+    const manifest = path.join(root, 'node_modules', ...NPM_PACKAGE.split('/'), 'package.json');
+    const version: unknown = JSON.parse(fs.readFileSync(manifest, 'utf-8')).version;
+    return typeof version === 'string' ? version : null;
+  } catch {
+    return null;
+  }
+}
+
+export function defaultCapture(cmd: string, args: string[]): { code: number; stdout: string } | null {
+  // stdio is piped (the default with `encoding`), so nothing the probed
+  // command prints reaches the user's terminal. The timeout keeps a wedged
+  // probe from hanging the upgrade's last step.
+  const r = spawnSync(cmd, args, { encoding: 'utf-8', windowsHide: true, timeout: 30_000 });
+  if (r.error) return null;
+  return { code: r.status ?? -1, stdout: r.stdout ?? '' };
+}
+
+/**
+ * The production `UpgradeDeps.wirePromptHook`: writes the hook only when the
+ * global Claude profile already carries CodeGraph's MCP entry, and leaves the
+ * file byte-for-byte alone once the hook is there.
+ */
+export async function defaultWirePromptHook(): Promise<boolean> {
+  const { claudeTarget, writePromptHookEntry } = await import('../installer/targets/claude');
+  if (!claudeTarget.detect('global').alreadyConfigured) return false;
+  const res = writePromptHookEntry('global');
+  return res.action === 'created' || res.action === 'updated';
 }

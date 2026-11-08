@@ -303,7 +303,11 @@ export class CodeGraphTreeProvider implements vscode.TreeDataProvider<CodeGraphT
         // Bug B fix: Use empty string instead of '*'.
         // searchNodes('') → parseQuery('') → text='' → searchAllByFilters()
         // which returns all nodes without FTS5 query issues.
-        query: '',
+        // 上游 1.x 适配：MCP 层新增了「query 必须是非空字符串」的校验，
+        // 空串会被直接拒绝并返回 isError，导致符号树空白。
+        // 因此传单个空格：parseQuery(' ') 分词后 text 仍为空串，
+        // 服务端照旧走 searchAllByFilters 返回全部符号，兼顾新旧版本。
+        query: ' ',
         limit: 50,
         projectPath: this.manager.getProjectPath(),
       });
@@ -423,10 +427,16 @@ export class CodeGraphTreeProvider implements vscode.TreeDataProvider<CodeGraphT
    */
   private parseSymbolsFromSearch(text: string): Array<{ name: string; kind: string; filePath: string; line: number }> {
     const symbols: Array<{ name: string; kind: string; filePath: string; line: number }> = [];
-    const entryRegex = /### (.+?) \((\w+)\)\n(.+?)(?:\n`(.+?)`)?/g;
+    // 兼容性归一化（上游 CodeGraph 1.x 起）：搜索条目标题由
+    // `### name (kind)` 改为 `**name** (kind)`。先按行还原成旧标题，
+    // 后续沿用同一正则，保证新旧 CLI 都能解析出符号列表。
+    const normalized = text.replace(/^\*\*(.+?)\*\* \((\w+)\)\s*$/gm, '### $1 ($2)');
+    // Fix#18: 位置行用贪婪不跨行的 [^\n]+，否则可选签名组会让惰性 (.+?)
+    // 只匹配 1 个字符，符号路径退化成首字母，树节点无法打开正确文件。
+    const entryRegex = /### (.+?) \((\w+)\)\n([^\n]+)(?:\n`([^\n]+)`)?/g;
     let match: RegExpExecArray | null;
 
-    while ((match = entryRegex.exec(text)) !== null) {
+    while ((match = entryRegex.exec(normalized)) !== null) {
       const name = match[1];
       const kind = match[2];
       const location = match[3].trim();

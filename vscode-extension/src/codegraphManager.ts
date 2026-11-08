@@ -17,7 +17,9 @@
  *
  * Auto-install strategy:
  * 1. Primary: Standalone installer (curl/irm) — no npm/Node.js required
- * 2. Fallback: npm install -g @luowei729/codegraph
+ * 2. Fallback: npm install -g @colbymchenry/codegraph
+ *    （上游 npm 包名；旧版写的 @luowei729/codegraph 在 npm 上并不存在，
+ *      会导致兜底安装 404 必失败，这里修正为真实存在的上游包）
  * 3. If both fail: show error with manual install instructions
  *
  * Bug fixes applied:
@@ -185,8 +187,12 @@ export class CodeGraphManager implements vscode.Disposable {
 
     this.setState('indexing');
     try {
-      // Run codegraph init -i (creates .codegraph/ and indexes)
-      await this.runCliCommand('init', ['-i']);
+      // 上游 1.x 适配：`-i/--index` 已废弃（初始化默认就建索引），
+      // 新增 `-y/--yes` 为非交互模式——跳过全部 clack 提示并取默认值
+      // （含文件监视不可用时的 git hook 选择）。扩展以管道 stdin spawn，
+      // 非 TTY 下 clack 交互会永久挂起，用 -y 从源头避免该问题；
+      // runCliCommand 里的回车/EOF 注入仅作为旧版 CLI 的兜底保留。
+      await this.runCliCommand('init', ['-y']);
       // After successful init, start the MCP server
       await this.startCodeGraph();
       vscode.window.showInformationMessage(t('index.buildSuccess'));
@@ -249,10 +255,13 @@ export class CodeGraphManager implements vscode.Disposable {
       this.client = null;
       await vscode.commands.executeCommand('setContext', 'codegraph:ready', false);
 
-      // Remove the .codegraph directory
-      const codegraphDir = path.join(this.projectPath, '.codegraph');
-      if (fs.existsSync(codegraphDir)) {
-        fs.rmSync(codegraphDir, { recursive: true, force: true });
+      // Remove the index directory — 上游 1.x 可能是 .codegraph、
+      // WSL 专用的 .codegraph-wsl，或 CODEGRAPH_DIR 自定义名，
+      // 全部清理，避免残留索引让下次激活仍判定为「已初始化」。
+      for (const codegraphDir of this.indexDirCandidates(this.projectPath)) {
+        if (fs.existsSync(codegraphDir)) {
+          fs.rmSync(codegraphDir, { recursive: true, force: true });
+        }
       }
 
       this.setState('uninitialized');
@@ -375,8 +384,9 @@ export class CodeGraphManager implements vscode.Disposable {
    *    - Windows: irm https://raw.githubusercontent.com/luowei729/codegraph/main/install.ps1 | iex
    *    This downloads the correct binary for the OS without needing Node.js or npm.
    *
-   * 2. Fallback: npm install -g @luowei729/codegraph
+   * 2. Fallback: npm install -g @colbymchenry/codegraph
    *    Only attempted if the standalone installer fails AND npm is available.
+   *    注意：必须用上游真实包名，@luowei729/codegraph 在 npm 上不存在（404）。
    *
    * 3. If both fail: show error with manual install instructions.
    *
@@ -504,7 +514,10 @@ export class CodeGraphManager implements vscode.Disposable {
    */
   private async runNpmInstaller(): Promise<boolean> {
     return new Promise((resolve) => {
-      const child = spawn('npm', ['install', '-g', '@luowei729/codegraph'], {
+      // 上游 1.x 修复：兜底 npm 安装必须使用真实存在的上游包名
+      // @colbymchenry/codegraph；旧值 @luowei729/codegraph 在 npm 注册表
+      // 并不存在（实测 404），兜底安装永远不会成功。
+      const child = spawn('npm', ['install', '-g', '@colbymchenry/codegraph'], {
         // Use the user's home directory as cwd for global installs
         cwd: process.env.HOME || process.env.USERPROFILE || '.',
       });
@@ -790,9 +803,35 @@ export class CodeGraphManager implements vscode.Disposable {
     return null;
   }
 
-  /** Check if the project has been initialized with CodeGraph */
+  /**
+   * 列出该项目可能存在的索引目录名（上游 1.x 适配）。
+   *
+   * 为什么需要多个候选名？
+   * - 默认目录仍是 `.codegraph`；
+   * - 上游在 WSL 下索引 Windows 盘符项目时会改用 `.codegraph-wsl`，
+   *   避免和 Windows 原生 CodeGraph 共用同一份 SQLite 索引；
+   * - 上游支持 `CODEGRAPH_DIR` 环境变量自定义目录名。
+   * 扩展若只认 `.codegraph`，会把已建索引的项目误判为未初始化，
+   * 反复弹出「建立索引」提示。
+   */
+  private indexDirCandidates(projectPath: string): string[] {
+    const names = ['.codegraph', '.codegraph-wsl'];
+    const override = process.env.CODEGRAPH_DIR?.trim();
+    // 与服务端校验保持一致：只接受纯目录名（无路径分隔符、非 . / ..）
+    if (override && !/[\\/]/.test(override) && override !== '.' && override !== '..') {
+      names.push(override);
+    }
+    return names.map((name) => path.join(projectPath, name));
+  }
+
+  /**
+   * Check whether the project has a CodeGraph index.
+   *
+   * 上游 1.x 适配：除默认 `.codegraph` 外，还要识别 WSL 的
+   * `.codegraph-wsl` 与 `CODEGRAPH_DIR` 自定义目录。
+   */
   private isCodeGraphInitialized(projectPath: string): boolean {
-    return fs.existsSync(path.join(projectPath, '.codegraph'));
+    return this.indexDirCandidates(projectPath).some((dir) => fs.existsSync(dir));
   }
 
   /**

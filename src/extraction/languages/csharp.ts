@@ -32,26 +32,60 @@ export function blankCsharpPreprocessorDirectives(source: string): string {
   return source.replace(re, (m, indent) => indent + ' '.repeat(m.length - indent.length));
 }
 
+/**
+ * A C# method's declared return type, normalized to the bare class name a chained
+ * `Foo.Create().Bar()` could be called on (the #645/#608 mechanism). The return
+ * type lives in the `returns` field (`static Foo Create()` → `Foo`); built-in
+ * `predefined_type` (void/int/string/…) and arrays yield undefined, generics are
+ * unwrapped to the base type, nullable `Foo?` is stripped, and a dotted namespace
+ * is reduced to the simple name. Constructors have no `returns` field → undefined.
+ */
+function extractCsharpReturnType(node: SyntaxNode, source: string): string | undefined {
+  const typeNode = node.childForFieldName('returns');
+  if (!typeNode) return undefined;
+  if (typeNode.type === 'predefined_type' || typeNode.type === 'array_type') return undefined;
+  let t = getNodeText(typeNode, source).trim();
+  t = t.replace(/\?+$/, ''); // nullable `Foo?`
+  t = t.replace(/<[^>]*>/g, ''); // generics `List<Foo>` → `List`
+  const last = t.split('.').pop()?.trim(); // namespace `Ns.Foo` → `Foo`
+  if (!last || !/^[A-Za-z_]\w*$/.test(last)) return undefined;
+  return last;
+}
+
+/** Where a C# declaration with no access modifier defaults to `internal`. */
+const CSHARP_TYPE_SCOPES = new Set(['compilation_unit', 'namespace_declaration', 'file_scoped_namespace_declaration']);
+
 export const csharpExtractor: LanguageExtractor = {
   preParse: blankCsharpPreprocessorDirectives,
   functionTypes: [],
   // Records are first-class type declarations in modern C# (DTOs, value objects,
-  // MediatR/CQRS messages). `record` / `record class` parse as record_declaration
-  // (reference type → class); `record struct` as record_struct_declaration (value
-  // type → struct). Without these, references to a record never resolve (#237).
+  // MediatR/CQRS messages). Without these, references to a record never resolve
+  // (#237). The shipped grammar parses EVERY record form as record_declaration —
+  // `record struct` / `readonly record struct` included (it has no
+  // record_struct_declaration node; that structTypes entry is forward-compat
+  // only) — so classifyClassNode tells the value-type form apart by its
+  // `struct` keyword child. (#831 follow-up)
   classTypes: ['class_declaration', 'record_declaration'],
   methodTypes: ['method_declaration', 'constructor_declaration'],
   interfaceTypes: ['interface_declaration'],
   structTypes: ['struct_declaration', 'record_struct_declaration'],
+  classifyClassNode: (node) => {
+    if (node.type === 'record_declaration') {
+      for (let i = 0; i < node.childCount; i++) {
+        if (node.child(i)?.type === 'struct') return 'struct';
+      }
+    }
+    return 'class';
+  },
   enumTypes: ['enum_declaration'],
   enumMemberTypes: ['enum_member_declaration'],
   typeAliasTypes: [],
   // Namespaces qualify type names so same-named types in different namespaces are
   // distinguishable (e.g. `ApplicationCore.Entities.CatalogBrand` vs
-  // `BlazorShared.Models.CatalogBrand`). Both block (`namespace Foo { … }`, which
-  // nests its types) and file-scoped (`namespace Foo;`) forms — extractFilePackage
-  // pushes the namespace onto the scope so nested/top-level types pick it up.
-  packageTypes: ['namespace_declaration', 'file_scoped_namespace_declaration'],
+  // `BlazorShared.Models.CatalogBrand`). A file-scoped `namespace Foo;` covers the
+  // whole file (extractFilePackage); a block `namespace Foo { … }` only its body
+  // (the visitor scopes it).
+  packageTypes: ['file_scoped_namespace_declaration'],
   extractPackage: (node: SyntaxNode, source: string) => {
     const name =
       node.childForFieldName('name') ??
@@ -67,6 +101,7 @@ export const csharpExtractor: LanguageExtractor = {
   bodyField: 'body',
   paramsField: 'parameters',
   returnField: 'type',
+  getReturnType: extractCsharpReturnType,
   getVisibility: (node) => {
     for (let i = 0; i < node.childCount; i++) {
       const child = node.child(i);
@@ -78,7 +113,12 @@ export const csharpExtractor: LanguageExtractor = {
         if (text === 'internal') return 'internal';
       }
     }
-    return 'private'; // C# defaults to private
+    // No modifier: an interface's members are public, a type declared in a
+    // namespace (or the file) is internal, and a class or struct member is private.
+    const container = node.parent?.type === 'declaration_list' ? node.parent.parent : node.parent;
+    if (container?.type === 'interface_declaration') return 'public';
+    if (!container || CSHARP_TYPE_SCOPES.has(container.type)) return 'internal';
+    return 'private';
   },
   isStatic: (node) => {
     for (let i = 0; i < node.childCount; i++) {
@@ -88,6 +128,22 @@ export const csharpExtractor: LanguageExtractor = {
       }
     }
     return false;
+  },
+  // `const` and `static readonly` fields are C# constants (`MaxItems`, lookup
+  // tables, shared config). Drives `constant` kind so value-reference edges
+  // target them; instance `readonly` / plain `static` fields stay `field`s.
+  isConst: (node) => {
+    let hasStatic = false;
+    let hasReadonly = false;
+    for (let i = 0; i < node.childCount; i++) {
+      const child = node.child(i);
+      if (child?.type !== 'modifier') continue;
+      const t = child.text;
+      if (t === 'const') return true;
+      if (t === 'static') hasStatic = true;
+      else if (t === 'readonly') hasReadonly = true;
+    }
+    return hasStatic && hasReadonly;
   },
   isAsync: (node) => {
     for (let i = 0; i < node.childCount; i++) {

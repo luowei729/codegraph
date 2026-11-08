@@ -7,10 +7,10 @@ description: Full index, incremental sync, and the file watcher.
 
 ```bash
 cd your-project
-codegraph init -i      # initialize + full index
+codegraph init      # creates .codegraph/ and builds the full graph — one step
 ```
 
-`init` creates `.codegraph/`; `-i`/`--index` builds the index immediately. To initialize without indexing, drop the flag and run `codegraph index` later.
+`codegraph init` creates the local `.codegraph/` directory and builds the full graph in the same step — one command, done. There's no separate index step to run afterward, and from here the graph [stays fresh automatically](#stay-fresh-automatically).
 
 ## Full vs. incremental
 
@@ -20,11 +20,11 @@ codegraph index --force   # re-index from scratch
 codegraph sync            # incremental — only changed files
 ```
 
-`sync` is fast because it only reparses what changed. Use it after a branch switch or a batch of edits.
+`sync` is fast because it only reparses what changed — it's what the file watcher runs for you on every edit (see [Stay fresh automatically](#stay-fresh-automatically)). You rarely need to run it by hand.
 
 ## Stay fresh automatically
 
-**You don't need to run `codegraph sync` by hand during an agent session.** When your agent (Claude Code, Cursor, Codex, opencode, Hermes, Gemini, Antigravity, Kiro) launches `codegraph serve --mcp`, three layers cooperate to keep the index in step with your code — and to never give the agent a quiet wrong answer in the small window between an edit and the next sync.
+**You don't need to run `codegraph sync` by hand during an agent session.** When your agent (Claude Code, Cursor, Codex, opencode, Hermes, Gemini, Antigravity, Kiro, GitHub Copilot) launches `codegraph serve --mcp`, three layers cooperate to keep the index in step with your code — and to never give the agent a quiet wrong answer in the small window between an edit and the next sync.
 
 ### 1. File watcher with debounced auto-sync (always on)
 

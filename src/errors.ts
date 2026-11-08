@@ -162,6 +162,20 @@ export class ConfigError extends CodeGraphError {
 }
 
 /**
+ * A refused path — the caller asked for something outside the project root, or
+ * for a sensitive system directory. Deliberately a plain `Error` and NOT a
+ * {@link CodeGraphError}: it is a security marker every read sink tests with
+ * `instanceof`, not a categorized operational failure, and the MCP layer treats
+ * it as one of the only two "stop trying" conditions (see `mcp/tools.ts`).
+ *
+ * It lives here — in the dependency-free error module — rather than next to its
+ * first caller so that a consumer can enforce the refusal WITHOUT importing the
+ * MCP tool graph. `mcp/tools.ts` re-exports it, so the class identity stays
+ * single and every existing `instanceof` check keeps working.
+ */
+export class PathRefusalError extends Error {}
+
+/**
  * Simple logger for CodeGraph operations
  *
  * By default, logs to console.warn for warnings and console.error for errors.
@@ -209,6 +223,20 @@ let currentLogger: Logger = defaultLogger;
  */
 export function setLogger(logger: Logger): void {
   currentLogger = logger;
+}
+
+/**
+ * Thrown by a `syncFn` to signal that the underlying sync couldn't acquire
+ * the cross-process write lock (#449). The watcher treats this as "no
+ * progress" — preserves `pendingFiles`, skips `onSyncComplete`, and the
+ * `finally` block reschedules. Quiet (debug-only) because a long-running
+ * external indexer can hit this every debounce cycle.
+ */
+export class LockUnavailableError extends Error {
+  constructor(message = 'CodeGraph file lock unavailable; another process is writing') {
+    super(message);
+    this.name = 'LockUnavailableError';
+  }
 }
 
 /**

@@ -1,7 +1,11 @@
 {
   "name": "@colbymchenry/codegraph",
-  "version": "0.9.22",
-  "description": "Supercharge Claude Code with semantic code intelligence. 94% fewer tool calls • 77% faster exploration • 100% local.",
+  "version": "1.6.2",
+  "description": "Supercharge AI coding agents with semantic code intelligence — surgical context, fewer tool calls, faster answers. 100% local.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/colbymchenry/codegraph.git"
+  },
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "bin": {
@@ -12,11 +16,24 @@
     "scripts",
     "README.md"
   ],
+  "workspaces": [
+    "ui"
+  ],
+  "devEngines": {
+    "runtime": {
+      "name": "node",
+      "version": ">=22.12.0",
+      "onFail": "error"
+    }
+  },
   "scripts": {
-    "build": "tsc && npm run copy-assets && node -e \"require('fs').chmodSync('dist/bin/codegraph.js', 0o755)\"",
+    "build": "tsc && tsc --emitDeclarationOnly --noCheck --removeComments false && npm run copy-assets && npm run build:ui && node -e \"require('fs').chmodSync('dist/bin/codegraph.js', 0o755)\"",
+    "build:ui": "cd ui && npm run build && cd .. && node scripts/check-ui-build.mjs",
+    "build:lib": "cd ui && npm run build:lib",
     "preuninstall": "node dist/bin/uninstall.js",
     "copy-assets": "node -e \"const fs=require('fs');fs.mkdirSync('dist/db',{recursive:true});fs.copyFileSync('src/db/schema.sql','dist/db/schema.sql');fs.mkdirSync('dist/extraction/wasm',{recursive:true});fs.readdirSync('src/extraction/wasm').filter(f=>f.endsWith('.wasm')).forEach(f=>fs.copyFileSync('src/extraction/wasm/'+f,'dist/extraction/wasm/'+f))\"",
     "dev": "tsc --watch",
+    "build:kernel": "bash scripts/build-kernel.sh",
     "cli": "npm run build && node dist/bin/codegraph.js",
     "test": "vitest run",
     "test:watch": "vitest",
@@ -36,7 +53,7 @@
     "commander": "^14.0.2",
     "fast-string-width": "^3.0.2",
     "fast-wrap-ansi": "^0.2.0",
-    "ignore": "^7.0.5",
+    "ignore": "^7.0.14",
     "jsonc-parser": "^3.3.1",
     "picomatch": "^4.0.3",
     "sisteransi": "^1.0.5",
@@ -44,11 +61,12 @@
     "web-tree-sitter": "^0.25.3"
   },
   "devDependencies": {
-    "@types/better-sqlite3": "^7.6.0",
+    "@sveltejs/vite-plugin-svelte": "^6.2.4",
     "@types/node": "^20.19.30",
     "@types/picomatch": "^4.0.2",
+    "jsdom": "^25.0.1",
     "typescript": "^5.0.0",
-    "vitest": "^2.1.9"
+    "vitest": "^4.1.11"
   },
   "engines": {
     "node": ">=20.0.0 <25.0.0"

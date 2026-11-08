@@ -23,6 +23,152 @@
  * framework extractors scan for.
  */
 
+/**
+ * Text before a `/` (up to ~32 chars) after which that `/` can open a regex
+ * literal rather than divide: expression-start punctuation or a keyword.
+ * A heuristic — callers that act on a guess must tolerate it being wrong.
+ */
+export const REGEX_START_BEFORE = /(?:^|[=(:,)!&|?;{}\[\]+*%~^<>-]|\b(?:return|throw|case|yield|await|else|do|typeof|void|delete|new|in|of|instanceof))\s*$/;
+
+/**
+ * Blank string contents while preserving quotes and offsets. Template
+ * interpolations are blanked too; callers checking executable expressions
+ * must conservatively inspect those expressions in the original source.
+ * `regexLiterals`, when given, receives the offsets of the opening and
+ * closing `/` of every span read as a regex literal (left as is).
+ */
+export function blankStringContents(text: string, regexLiterals?: number[]): string {
+  const out = text.split('');
+  let i = 0;
+  const n = text.length;
+  while (i < n) {
+    const c = text[i]!;
+    // A quote inside a JS regex is data, not the beginning of a string.
+    // Expression-start punctuation and keywords distinguish these from division.
+    if (c === '/' && REGEX_START_BEFORE.test(text.slice(Math.max(0, i - 32), i))) {
+      let end = i + 1;
+      let inClass = false;
+      for (; end < n && text[end] !== '\n'; end++) {
+        if (text[end] === '\\') { end++; continue; }
+        if (text[end] === '[') inClass = true;
+        if (text[end] === ']') inClass = false;
+        if (text[end] === '/' && !inClass) break;
+      }
+      if (end < n && text[end] === '/') {
+        regexLiterals?.push(i, end);
+        i = end + 1;
+        continue;
+      }
+    }
+    if (c === '"' || c === "'" || c === '`') {
+      const quote = c;
+      i++;
+      while (i < n && text[i] !== quote) {
+        if (text[i] === '\\' && i + 1 < n) {
+          out[i] = ' ';
+          out[i + 1] = ' ';
+          i += 2;
+          continue;
+        }
+        if (quote !== '`' && text[i] === '\n') break;
+        if (text[i] !== '\n') out[i] = ' ';
+        i++;
+      }
+      if (i < n && text[i] === quote) i++;
+      continue;
+    }
+    i++;
+  }
+  return out.join('');
+}
+
+/** A keyword after which a `/` opens a regex literal, at the end of the text before it. */
+const REGEX_AFTER_KEYWORD = /(?:^|[^\w$])(?:return|throw|case|yield|await|else|do|typeof|void|delete|new|in|of|instanceof)$/;
+
+/**
+ * Whether the `/` at `at` opens a regex literal: it does where an expression
+ * starts, and divides after a value — a `)`, `]`, string, name or number.
+ */
+function slashOpensRegex(src: string, at: number): boolean {
+  let j = at - 1;
+  while (j >= 0 && (src[j] === ' ' || src[j] === '\t' || src[j] === '\n' || src[j] === '\r')) j--;
+  if (j < 0) return true;
+  const before = src[j]!;
+  if (before === ')' || before === ']' || before === '"' || before === "'" || before === '`') return false;
+  if (/[\w$]/.test(before)) return REGEX_AFTER_KEYWORD.test(src.slice(Math.max(0, j - 10), j + 1));
+  return true;
+}
+
+/**
+ * Where JS/TS template-literal text lies in `src`: a test of whether offset
+ * `at` falls in a template's literal text — not its `${…}` code — or null when
+ * a template never closes, so the scan vouches for nothing. Offsets match
+ * {@link stripCommentsForRegex}'s output, which keeps them.
+ *
+ * Unlike {@link blankStringContents} it follows `${…}` nesting (a template in
+ * an interpolation, a brace in a regex there) and skips comments, strings and
+ * regex literals, which may hold a backtick (`/[`]/`).
+ */
+export function templateLiteralTextAt(src: string): ((at: number) => boolean) | null {
+  /** Template text spans, `[start, end)` pairs in order. */
+  const spans: number[] = [];
+  /** Innermost last: an open template's current text start, or an open `${…}`'s unclosed braces. */
+  const open: Array<{ text: number } | { braces: number }> = [];
+  const n = src.length;
+  for (let i = 0; i < n; i++) {
+    const c = src[i];
+    const top = open[open.length - 1];
+    if (top && 'text' in top) {
+      if (c === '\\') i++;
+      else if (c === '`') {
+        spans.push(top.text, i);
+        open.pop();
+      } else if (c === '$' && src[i + 1] === '{') {
+        spans.push(top.text, i);
+        open.push({ braces: 0 });
+        i++;
+      }
+      continue;
+    }
+    if (c === '`') open.push({ text: i + 1 });
+    else if (c === '"' || c === "'") {
+      for (i++; i < n && src[i] !== c && src[i] !== '\n'; i++) if (src[i] === '\\') i++;
+    } else if (c === '/' && src[i + 1] === '/') {
+      while (i < n && src[i] !== '\n') i++;
+    } else if (c === '/' && src[i + 1] === '*') {
+      const close = src.indexOf('*/', i + 2);
+      i = close < 0 ? n : close + 1;
+    } else if (c === '/' && slashOpensRegex(src, i)) {
+      let inClass = false;
+      for (let j = i + 1; j < n && src[j] !== '\n'; j++) {
+        if (src[j] === '\\') j++;
+        else if (src[j] === '[') inClass = true;
+        else if (src[j] === ']') inClass = false;
+        else if (src[j] === '/' && !inClass) {
+          i = j;
+          break;
+        }
+      }
+    } else if (top && c === '{') top.braces++;
+    else if (top && c === '}' && top.braces-- === 0) {
+      open.pop();
+      (open[open.length - 1] as { text: number }).text = i + 1;
+    }
+  }
+  if (open.length > 0) return null;
+  return (at) => {
+    // The first span ending after `at`, then whether it starts at or before it.
+    let lo = 0;
+    let hi = spans.length / 2;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (spans[2 * mid + 1]! <= at) lo = mid + 1;
+      else hi = mid;
+    }
+    return lo < spans.length / 2 && spans[2 * lo]! <= at;
+  };
+}
+
 export type CommentLang =
   | 'python'
   | 'javascript'
@@ -33,7 +179,10 @@ export type CommentLang =
   | 'csharp'
   | 'swift'
   | 'go'
-  | 'rust';
+  | 'rust'
+  | 'c'
+  | 'cpp'
+  | 'erlang';
 
 export function stripCommentsForRegex(content: string, lang: CommentLang): string {
   switch (lang) {
@@ -43,6 +192,8 @@ export function stripCommentsForRegex(content: string, lang: CommentLang): strin
       return stripRuby(content);
     case 'rust':
       return stripRust(content);
+    case 'erlang':
+      return stripErlang(content);
     case 'php':
       return stripPhp(content);
     case 'go':
@@ -52,6 +203,8 @@ export function stripCommentsForRegex(content: string, lang: CommentLang): strin
     case 'java':
     case 'csharp':
     case 'swift':
+    case 'c':
+    case 'cpp':
       return stripCStyle(content, /* allowSingleQuoteStrings */ lang === 'javascript' || lang === 'typescript');
     default:
       return content;
@@ -59,19 +212,42 @@ export function stripCommentsForRegex(content: string, lang: CommentLang): strin
 }
 
 /**
- * Replace every char in a slice with spaces, but keep newlines so line
- * numbers computed downstream remain valid.
+ * A source with ranges blanked, keeping newlines so line numbers computed
+ * downstream remain valid. The strippers scan forward, so ranges arrive in
+ * order and the text between them is copied by the slice: a file used to be
+ * split into an array of characters and joined back, which made stripping one
+ * of the larger costs of resolving a big repo.
  */
-function blankRange(buf: string[], start: number, end: number, src: string): void {
-  for (let i = start; i < end; i++) {
-    buf[i] = src[i] === '\n' ? '\n' : ' ';
+class BlankedText {
+  private readonly parts: string[] = [];
+  /** Where the text not yet in `parts` starts. */
+  private copied = 0;
+
+  constructor(private readonly src: string) {}
+
+  blank(start: number, end: number): void {
+    if (end <= start) return;
+    const { src, parts } = this;
+    parts.push(src.slice(this.copied, start));
+    let at = start;
+    for (let nl = src.indexOf('\n', at); nl >= 0 && nl < end; nl = src.indexOf('\n', at)) {
+      parts.push(' '.repeat(nl - at), '\n');
+      at = nl + 1;
+    }
+    parts.push(' '.repeat(end - at));
+    this.copied = end;
+  }
+
+  text(): string {
+    this.parts.push(this.src.slice(this.copied));
+    return this.parts.join('');
   }
 }
 
 // ---------- Python ----------
 
 function stripPython(src: string): string {
-  const out = src.split('');
+  const out = new BlankedText(src);
   let i = 0;
   const n = src.length;
 
@@ -96,7 +272,7 @@ function stripPython(src: string): string {
         }
         i++;
       }
-      blankRange(out, start, i, src);
+      out.blank(start, i);
       continue;
     }
 
@@ -120,20 +296,20 @@ function stripPython(src: string): string {
     if (c === '#') {
       const start = i;
       while (i < n && src[i] !== '\n') i++;
-      blankRange(out, start, i, src);
+      out.blank(start, i);
       continue;
     }
 
     i++;
   }
 
-  return out.join('');
+  return out.text();
 }
 
 // ---------- Ruby ----------
 
 function stripRuby(src: string): string {
-  const out = src.split('');
+  const out = new BlankedText(src);
   let i = 0;
   const n = src.length;
   let atLineStart = true;
@@ -160,7 +336,7 @@ function stripRuby(src: string): string {
         }
         i++;
       }
-      blankRange(out, start, i, src);
+      out.blank(start, i);
       atLineStart = i > 0 && src[i - 1] === '\n';
       continue;
     }
@@ -186,7 +362,7 @@ function stripRuby(src: string): string {
     if (c === '#') {
       const start = i;
       while (i < n && src[i] !== '\n') i++;
-      blankRange(out, start, i, src);
+      out.blank(start, i);
       atLineStart = false;
       continue;
     }
@@ -205,13 +381,13 @@ function stripRuby(src: string): string {
     i++;
   }
 
-  return out.join('');
+  return out.text();
 }
 
 // ---------- C-style (JS/TS/Java/C#/Swift) ----------
 
 function stripCStyle(src: string, allowSingleQuoteStrings: boolean): string {
-  const out = src.split('');
+  const out = new BlankedText(src);
   let i = 0;
   const n = src.length;
 
@@ -225,7 +401,7 @@ function stripCStyle(src: string, allowSingleQuoteStrings: boolean): string {
       i += 2;
       while (i < n && !(src[i] === '*' && src[i + 1] === '/')) i++;
       if (i < n) i += 2;
-      blankRange(out, start, i, src);
+      out.blank(start, i);
       continue;
     }
 
@@ -233,7 +409,7 @@ function stripCStyle(src: string, allowSingleQuoteStrings: boolean): string {
     if (c === '/' && c2 === '/') {
       const start = i;
       while (i < n && src[i] !== '\n') i++;
-      blankRange(out, start, i, src);
+      out.blank(start, i);
       continue;
     }
 
@@ -257,13 +433,13 @@ function stripCStyle(src: string, allowSingleQuoteStrings: boolean): string {
     i++;
   }
 
-  return out.join('');
+  return out.text();
 }
 
 // ---------- PHP ----------
 
 function stripPhp(src: string): string {
-  const out = src.split('');
+  const out = new BlankedText(src);
   let i = 0;
   const n = src.length;
 
@@ -277,7 +453,7 @@ function stripPhp(src: string): string {
       i += 2;
       while (i < n && !(src[i] === '*' && src[i + 1] === '/')) i++;
       if (i < n) i += 2;
-      blankRange(out, start, i, src);
+      out.blank(start, i);
       continue;
     }
 
@@ -285,7 +461,7 @@ function stripPhp(src: string): string {
     if (c === '/' && c2 === '/') {
       const start = i;
       while (i < n && src[i] !== '\n') i++;
-      blankRange(out, start, i, src);
+      out.blank(start, i);
       continue;
     }
 
@@ -293,7 +469,7 @@ function stripPhp(src: string): string {
     if (c === '#') {
       const start = i;
       while (i < n && src[i] !== '\n') i++;
-      blankRange(out, start, i, src);
+      out.blank(start, i);
       continue;
     }
 
@@ -317,13 +493,13 @@ function stripPhp(src: string): string {
     i++;
   }
 
-  return out.join('');
+  return out.text();
 }
 
 // ---------- Go ----------
 
 function stripGo(src: string): string {
-  const out = src.split('');
+  const out = new BlankedText(src);
   let i = 0;
   const n = src.length;
 
@@ -337,7 +513,7 @@ function stripGo(src: string): string {
       i += 2;
       while (i < n && !(src[i] === '*' && src[i + 1] === '/')) i++;
       if (i < n) i += 2;
-      blankRange(out, start, i, src);
+      out.blank(start, i);
       continue;
     }
 
@@ -345,7 +521,7 @@ function stripGo(src: string): string {
     if (c === '/' && c2 === '/') {
       const start = i;
       while (i < n && src[i] !== '\n') i++;
-      blankRange(out, start, i, src);
+      out.blank(start, i);
       continue;
     }
 
@@ -390,13 +566,13 @@ function stripGo(src: string): string {
     i++;
   }
 
-  return out.join('');
+  return out.text();
 }
 
 // ---------- Rust ----------
 
 function stripRust(src: string): string {
-  const out = src.split('');
+  const out = new BlankedText(src);
   let i = 0;
   const n = src.length;
 
@@ -420,7 +596,7 @@ function stripRust(src: string): string {
           i++;
         }
       }
-      blankRange(out, start, i, src);
+      out.blank(start, i);
       continue;
     }
 
@@ -428,7 +604,7 @@ function stripRust(src: string): string {
     if (c === '/' && c2 === '/') {
       const start = i;
       while (i < n && src[i] !== '\n') i++;
-      blankRange(out, start, i, src);
+      out.blank(start, i);
       continue;
     }
 
@@ -465,5 +641,57 @@ function stripRust(src: string): string {
     i++;
   }
 
-  return out.join('');
+  return out.text();
+}
+
+// ---------- Erlang ----------
+
+/**
+ * Erlang: `%` starts a line comment unless it sits inside a `"string"`, a
+ * `'quoted atom'`, or is the character literal `$%`. Strings and quoted atoms
+ * are left intact (a behaviour callback name can be a quoted atom); only the
+ * comment text is blanked.
+ */
+function stripErlang(src: string): string {
+  const out = new BlankedText(src);
+  let i = 0;
+  const n = src.length;
+
+  while (i < n) {
+    const c = src[i];
+
+    if (c === '"' || c === "'") {
+      const quote = c;
+      i++;
+      while (i < n && src[i] !== quote) {
+        if (src[i] === '\\' && i + 1 < n) {
+          i += 2;
+          continue;
+        }
+        i++;
+      }
+      if (i < n) i++;
+      continue;
+    }
+
+    // Character literal: `$x`, `$\n`, `$%` — the next char (or escape) is data.
+    if (c === '$') {
+      i++;
+      if (i < n && src[i] === '\\') i++;
+      i++;
+      continue;
+    }
+
+    if (c === '%') {
+      let end = i;
+      while (end < n && src[end] !== '\n') end++;
+      out.blank(i, end);
+      i = end;
+      continue;
+    }
+
+    i++;
+  }
+
+  return out.text();
 }
